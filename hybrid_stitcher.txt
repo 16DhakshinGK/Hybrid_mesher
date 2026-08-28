@@ -1,0 +1,568 @@
+PROGRAM stitch_nine_block_with_hybrid_block6
+
+!------------------------------------------------------------------------------
+! Standalone CGNS stitcher.
+!
+! Purpose:
+!   Do NOT regenerate the nine-block mesh.
+!
+!   Instead:
+!     1. Open an already-existing nine_block.cgns.
+!     2. Copy its zones into a new output file, skipping the old Block6 pair.
+!     3. Open the hybrid Block6 CGNS file.
+!     4. Import it once as Block6_HybridImported.
+!     5. Import it again as Block15_HybridImported, shifted by -pitch.
+!
+! This replaces the inefficient workflow where the full nine-block Fortran
+! geometry code reruns just to stitch CGNS files together.
+!
+! Notes:
+!   - Structured zones are copied as structured zones with coordinates.
+!   - Unstructured zones are copied as unstructured zones with coordinates
+!     and supported element sections.
+!   - The old structured Block6 and Block15 zones are skipped.
+!------------------------------------------------------------------------------
+
+    USE cgns
+    IMPLICIT NONE
+
+    CHARACTER(LEN=*), PARAMETER :: input_nine_file = "nine_block.cgns"
+    CHARACTER(LEN=*), PARAMETER :: input_hybrid_block6_file = &
+        "block6_structured_yheight_patch_smooth_normal_hybrid_fill.cgns"
+    CHARACTER(LEN=*), PARAMETER :: output_file = "nine_block_hybrid_stitched.cgns"
+
+    CHARACTER(LEN=*), PARAMETER :: old_block6_zone_name  = "Block6"
+    CHARACTER(LEN=*), PARAMETER :: old_block15_zone_name = "Block15"
+
+    CHARACTER(LEN=*), PARAMETER :: imported_block6_zone_name  = "Block6_HybridImported"
+    CHARACTER(LEN=*), PARAMETER :: imported_block15_zone_name = "Block15_HybridImported"
+
+    LOGICAL, PARAMETER :: read_pitch_from_nine_block_descriptor = .TRUE.
+    REAL(8), PARAMETER :: fallback_pitch = 0.592753D0
+
+    INTEGER, PARAMETER :: element_chunk_size = 50000
+
+    INTEGER :: ierr
+    INTEGER :: in_file_id
+    INTEGER :: out_file_id
+    INTEGER :: in_base_id
+    INTEGER :: out_base_id
+    INTEGER :: nbases
+    INTEGER :: nzones
+    INTEGER :: zone_id
+    INTEGER :: celldim
+    INTEGER :: physdim
+    INTEGER :: copied_zone_count
+    INTEGER :: skipped_zone_count
+
+    CHARACTER(LEN=128) :: base_name
+    CHARACTER(LEN=128) :: zone_name
+
+    REAL(8) :: pitch
+    LOGICAL :: got_pitch
+
+    ! CGNS zone sizes must be 3x3 for structured zones.
+    ! Using isize(3) corrupts memory when copying structured nine-block zones.
+    INTEGER(KIND=cgsize_t) :: isize(3,3)
+
+    CALL cg_open_f(TRIM(input_nine_file), CG_MODE_READ, in_file_id, ierr)
+    CALL check_cgns_error(ierr, "cg_open_f input nine_block")
+
+    CALL cg_nbases_f(in_file_id, nbases, ierr)
+    CALL check_cgns_error(ierr, "cg_nbases_f input nine_block")
+
+    IF (nbases < 1) THEN
+        PRINT *, "ERROR: input nine_block.cgns has no bases."
+        STOP 1
+    END IF
+
+    CALL find_first_3d_base(in_file_id, nbases, in_base_id, base_name, celldim, physdim)
+
+    CALL cg_nzones_f(in_file_id, in_base_id, nzones, ierr)
+    CALL check_cgns_error(ierr, "cg_nzones_f input nine_block")
+
+    pitch = fallback_pitch
+    got_pitch = .FALSE.
+
+    IF (read_pitch_from_nine_block_descriptor) THEN
+        CALL try_read_pitch_descriptor(in_file_id, in_base_id, pitch, got_pitch)
+    END IF
+
+    IF (got_pitch) THEN
+        PRINT *, "Read pitch from nine_block.cgns descriptor: ", pitch
+    ELSE
+        PRINT *, "Using fallback pitch: ", pitch
+    END IF
+
+    CALL cg_open_f(TRIM(output_file), CG_MODE_WRITE, out_file_id, ierr)
+    CALL check_cgns_error(ierr, "cg_open_f output stitched")
+
+    CALL cg_base_write_f(out_file_id, TRIM(base_name), celldim, physdim, out_base_id, ierr)
+    CALL check_cgns_error(ierr, "cg_base_write_f output stitched")
+
+    copied_zone_count = 0
+    skipped_zone_count = 0
+
+    PRINT *, "Copying zones from ", TRIM(input_nine_file)
+    PRINT *, "Skipping old zones named: ", TRIM(old_block6_zone_name), " and ", TRIM(old_block15_zone_name)
+
+    DO zone_id = 1, nzones
+
+        isize = INT(0, KIND=cgsize_t)
+
+        CALL cg_zone_read_f(in_file_id, in_base_id, zone_id, zone_name, isize, ierr)
+        CALL check_cgns_error(ierr, "cg_zone_read_f input zone")
+
+        IF (TRIM(zone_name) == TRIM(old_block6_zone_name) .OR. &
+            TRIM(zone_name) == TRIM(old_block15_zone_name)) THEN
+            PRINT *, "SKIPPED old zone: ", TRIM(zone_name)
+            skipped_zone_count = skipped_zone_count + 1
+            CYCLE
+        END IF
+
+        CALL copy_zone_coordinates_and_sections( &
+            in_file_id, in_base_id, zone_id, &
+            out_file_id, out_base_id, TRIM(zone_name), 0.0D0 &
+        )
+
+        copied_zone_count = copied_zone_count + 1
+
+    END DO
+
+    PRINT *, "Copied zones = ", copied_zone_count
+    PRINT *, "Skipped old Block6 zones = ", skipped_zone_count
+
+    PRINT *, "Importing hybrid Block6 pair from: ", TRIM(input_hybrid_block6_file)
+
+    CALL import_first_unstructured_zone_as( &
+        input_hybrid_block6_file, &
+        out_file_id, out_base_id, &
+        imported_block6_zone_name, &
+        0.0D0 &
+    )
+
+    CALL import_first_unstructured_zone_as( &
+        input_hybrid_block6_file, &
+        out_file_id, out_base_id, &
+        imported_block15_zone_name, &
+        -pitch &
+    )
+
+    CALL cg_close_f(out_file_id, ierr)
+    CALL check_cgns_error(ierr, "cg_close_f output stitched")
+
+    CALL cg_close_f(in_file_id, ierr)
+    CALL check_cgns_error(ierr, "cg_close_f input nine_block")
+
+    PRINT *, "Wrote stitched CGNS file: ", TRIM(output_file)
+
+CONTAINS
+
+
+    SUBROUTINE find_first_3d_base(file_id, nbases, base_id_out, base_name_out, celldim_out, physdim_out)
+
+        USE cgns
+        IMPLICIT NONE
+
+        INTEGER, INTENT(IN) :: file_id
+        INTEGER, INTENT(IN) :: nbases
+        INTEGER, INTENT(OUT) :: base_id_out
+        CHARACTER(LEN=*), INTENT(OUT) :: base_name_out
+        INTEGER, INTENT(OUT) :: celldim_out
+        INTEGER, INTENT(OUT) :: physdim_out
+
+        INTEGER :: b
+        INTEGER :: ierr_local
+        CHARACTER(LEN=128) :: bname
+        INTEGER :: cd
+        INTEGER :: pd
+
+        DO b = 1, nbases
+
+            CALL cg_base_read_f(file_id, b, bname, cd, pd, ierr_local)
+
+            IF (ierr_local == CG_OK .AND. cd == 3 .AND. pd == 3) THEN
+                base_id_out = b
+                base_name_out = TRIM(bname)
+                celldim_out = cd
+                physdim_out = pd
+                RETURN
+            END IF
+
+        END DO
+
+        PRINT *, "ERROR: could not find a 3D base in input CGNS file."
+        STOP 1
+
+    END SUBROUTINE find_first_3d_base
+
+
+    SUBROUTINE try_read_pitch_descriptor(file_id, base_id, pitch_out, success)
+
+        USE cgns
+        IMPLICIT NONE
+
+        INTEGER, INTENT(IN) :: file_id
+        INTEGER, INTENT(IN) :: base_id
+        REAL(8), INTENT(INOUT) :: pitch_out
+        LOGICAL, INTENT(OUT) :: success
+
+        INTEGER :: ierr_local
+        INTEGER :: ndesc
+        INTEGER :: d
+        CHARACTER(LEN=128) :: desc_name
+        CHARACTER(LEN=512) :: desc_text
+
+        success = .FALSE.
+
+        CALL cg_goto_f(file_id, base_id, ierr_local, "end")
+
+        IF (ierr_local /= CG_OK) RETURN
+
+        CALL cg_ndescriptors_f(ndesc, ierr_local)
+
+        IF (ierr_local /= CG_OK) RETURN
+
+        DO d = 1, ndesc
+
+            desc_name = ""
+            desc_text = ""
+
+            CALL cg_descriptor_read_f(d, desc_name, desc_text, ierr_local)
+
+            IF (ierr_local /= CG_OK) CYCLE
+
+            IF (TRIM(desc_name) == "Pitch") THEN
+                READ(desc_text, *, IOSTAT=ierr_local) pitch_out
+                IF (ierr_local == 0) success = .TRUE.
+                RETURN
+            END IF
+
+        END DO
+
+    END SUBROUTINE try_read_pitch_descriptor
+
+
+    SUBROUTINE copy_zone_coordinates_and_sections( &
+        in_file_id, in_base_id, in_zone_id, &
+        out_file_id, out_base_id, out_zone_name, y_shift &
+    )
+
+        USE cgns
+        IMPLICIT NONE
+
+        INTEGER, INTENT(IN) :: in_file_id
+        INTEGER, INTENT(IN) :: in_base_id
+        INTEGER, INTENT(IN) :: in_zone_id
+        INTEGER, INTENT(IN) :: out_file_id
+        INTEGER, INTENT(IN) :: out_base_id
+        CHARACTER(LEN=*), INTENT(IN) :: out_zone_name
+        REAL(8), INTENT(IN) :: y_shift
+
+        INTEGER :: ierr_local
+        INTEGER :: ztype
+        INTEGER :: out_zone_id
+        INTEGER :: coord_id
+        INTEGER :: nsections
+        INTEGER :: sec
+        INTEGER :: out_section_id
+        INTEGER :: element_type
+        INTEGER :: nbndry
+        INTEGER :: parent_flag
+        INTEGER :: npe
+        INTEGER :: nnode
+        INTEGER :: chunk_nelems
+        INTEGER :: chunk_id
+        INTEGER :: conn_size
+
+        CHARACTER(LEN=128) :: in_zone_name
+        CHARACTER(LEN=128) :: section_name
+        CHARACTER(LEN=128) :: copied_section_name
+
+        ! 3x3 is required because structured zones store vertex/cell/boundary sizes.
+        INTEGER(KIND=cgsize_t) :: isize_local(3,3)
+        INTEGER(KIND=cgsize_t) :: section_start
+        INTEGER(KIND=cgsize_t) :: section_end
+        INTEGER(KIND=cgsize_t) :: chunk_start
+        INTEGER(KIND=cgsize_t) :: chunk_end
+        INTEGER(KIND=cgsize_t) :: rmin(3)
+        INTEGER(KIND=cgsize_t) :: rmax(3)
+
+        REAL(8), ALLOCATABLE :: x(:)
+        REAL(8), ALLOCATABLE :: y(:)
+        REAL(8), ALLOCATABLE :: z(:)
+        INTEGER(KIND=cgsize_t), ALLOCATABLE :: conn(:)
+        INTEGER(KIND=cgsize_t), ALLOCATABLE :: parent_data(:)
+
+        isize_local = INT(0, KIND=cgsize_t)
+
+        CALL cg_zone_read_f(in_file_id, in_base_id, in_zone_id, in_zone_name, isize_local, ierr_local)
+        CALL check_cgns_error(ierr_local, "cg_zone_read_f copy zone")
+
+        CALL cg_zone_type_f(in_file_id, in_base_id, in_zone_id, ztype, ierr_local)
+        CALL check_cgns_error(ierr_local, "cg_zone_type_f copy zone")
+
+        IF (ztype == Structured) THEN
+            nnode = INT(isize_local(1,1)*isize_local(2,1)*isize_local(3,1))
+        ELSE IF (ztype == Unstructured) THEN
+            nnode = INT(isize_local(1,1))
+        ELSE
+            PRINT *, "WARNING: unsupported zone type, skipping zone: ", TRIM(in_zone_name)
+            RETURN
+        END IF
+
+        ALLOCATE(x(nnode), y(nnode), z(nnode))
+
+        IF (ztype == Structured) THEN
+            rmin(1) = INT(1, KIND=cgsize_t)
+            rmin(2) = INT(1, KIND=cgsize_t)
+            rmin(3) = INT(1, KIND=cgsize_t)
+
+            rmax(1) = isize_local(1,1)
+            rmax(2) = isize_local(2,1)
+            rmax(3) = isize_local(3,1)
+        ELSE
+            rmin(1) = INT(1, KIND=cgsize_t)
+            rmax(1) = INT(nnode, KIND=cgsize_t)
+            rmin(2) = INT(1, KIND=cgsize_t)
+            rmax(2) = INT(1, KIND=cgsize_t)
+            rmin(3) = INT(1, KIND=cgsize_t)
+            rmax(3) = INT(1, KIND=cgsize_t)
+        END IF
+
+        CALL cg_coord_read_f(in_file_id, in_base_id, in_zone_id, &
+            "CoordinateX", RealDouble, rmin, rmax, x, ierr_local)
+        CALL check_cgns_error(ierr_local, "cg_coord_read_f X copy zone")
+
+        CALL cg_coord_read_f(in_file_id, in_base_id, in_zone_id, &
+            "CoordinateY", RealDouble, rmin, rmax, y, ierr_local)
+        CALL check_cgns_error(ierr_local, "cg_coord_read_f Y copy zone")
+
+        CALL cg_coord_read_f(in_file_id, in_base_id, in_zone_id, &
+            "CoordinateZ", RealDouble, rmin, rmax, z, ierr_local)
+        CALL check_cgns_error(ierr_local, "cg_coord_read_f Z copy zone")
+
+        y = y + y_shift
+
+        CALL cg_zone_write_f(out_file_id, out_base_id, TRIM(out_zone_name), &
+            isize_local, ztype, out_zone_id, ierr_local)
+        CALL check_cgns_error(ierr_local, "cg_zone_write_f copy zone")
+
+        CALL cg_coord_write_f(out_file_id, out_base_id, out_zone_id, RealDouble, &
+            "CoordinateX", x, coord_id, ierr_local)
+        CALL check_cgns_error(ierr_local, "cg_coord_write_f X copy zone")
+
+        CALL cg_coord_write_f(out_file_id, out_base_id, out_zone_id, RealDouble, &
+            "CoordinateY", y, coord_id, ierr_local)
+        CALL check_cgns_error(ierr_local, "cg_coord_write_f Y copy zone")
+
+        CALL cg_coord_write_f(out_file_id, out_base_id, out_zone_id, RealDouble, &
+            "CoordinateZ", z, coord_id, ierr_local)
+        CALL check_cgns_error(ierr_local, "cg_coord_write_f Z copy zone")
+
+        DEALLOCATE(x, y, z)
+
+        IF (ztype == Unstructured) THEN
+
+            CALL cg_nsections_f(in_file_id, in_base_id, in_zone_id, nsections, ierr_local)
+            CALL check_cgns_error(ierr_local, "cg_nsections_f copy unstructured zone")
+
+            DO sec = 1, nsections
+
+                CALL cg_section_read_f( &
+                    in_file_id, in_base_id, in_zone_id, sec, &
+                    section_name, element_type, section_start, section_end, &
+                    nbndry, parent_flag, ierr_local &
+                )
+                CALL check_cgns_error(ierr_local, "cg_section_read_f copy unstructured zone")
+
+                npe = supported_element_node_count(element_type)
+
+                IF (npe <= 0) THEN
+                    PRINT *, "WARNING: skipping unsupported element section: ", TRIM(section_name)
+                    CYCLE
+                END IF
+
+                chunk_id = 0
+                chunk_start = section_start
+
+                DO WHILE (chunk_start <= section_end)
+
+                    chunk_end = MIN( &
+                        section_end, &
+                        chunk_start + INT(element_chunk_size-1, KIND=cgsize_t) &
+                    )
+
+                    chunk_nelems = INT(chunk_end - chunk_start + INT(1, KIND=cgsize_t))
+                    conn_size = npe*chunk_nelems
+
+                    ALLOCATE(conn(conn_size))
+
+                    IF (parent_flag /= 0) THEN
+                        ALLOCATE(parent_data(4*chunk_nelems))
+                    ELSE
+                        ALLOCATE(parent_data(1))
+                        parent_data = INT(0, KIND=cgsize_t)
+                    END IF
+
+                    CALL cg_elements_partial_read_f( &
+                        in_file_id, in_base_id, in_zone_id, sec, &
+                        chunk_start, chunk_end, conn, parent_data, ierr_local &
+                    )
+                    CALL check_cgns_error(ierr_local, "cg_elements_partial_read_f copy zone")
+
+                    DEALLOCATE(parent_data)
+
+                    chunk_id = chunk_id + 1
+
+                    WRITE(copied_section_name, '(A,I0,A,I0)') &
+                        TRIM(section_name)//"_Chunk", sec, "_", chunk_id
+
+                    CALL cg_section_write_f( &
+                        out_file_id, out_base_id, out_zone_id, &
+                        TRIM(copied_section_name), element_type, &
+                        chunk_start, chunk_end, &
+                        0, conn, out_section_id, ierr_local &
+                    )
+                    CALL check_cgns_error(ierr_local, "cg_section_write_f copy chunk")
+
+                    DEALLOCATE(conn)
+
+                    chunk_start = chunk_end + INT(1, KIND=cgsize_t)
+
+                END DO
+
+            END DO
+
+        END IF
+
+        PRINT *, "Copied zone: ", TRIM(in_zone_name), " -> ", TRIM(out_zone_name)
+
+    END SUBROUTINE copy_zone_coordinates_and_sections
+
+
+    SUBROUTINE import_first_unstructured_zone_as( &
+        hybrid_filename, out_file_id, out_base_id, out_zone_name, y_shift &
+    )
+
+        USE cgns
+        IMPLICIT NONE
+
+        CHARACTER(LEN=*), INTENT(IN) :: hybrid_filename
+        INTEGER, INTENT(IN) :: out_file_id
+        INTEGER, INTENT(IN) :: out_base_id
+        CHARACTER(LEN=*), INTENT(IN) :: out_zone_name
+        REAL(8), INTENT(IN) :: y_shift
+
+        INTEGER :: file_id
+        INTEGER :: nbases_local
+        INTEGER :: base_id
+        INTEGER :: zone_id
+        INTEGER :: nzones_local
+        INTEGER :: celldim_local
+        INTEGER :: physdim_local
+        INTEGER :: ztype
+        INTEGER :: ierr_local
+        INTEGER :: found
+
+        CHARACTER(LEN=128) :: base_name_local
+        CHARACTER(LEN=128) :: zone_name_local
+        INTEGER(KIND=cgsize_t) :: isize_local(3,3)
+
+        CALL cg_open_f(TRIM(hybrid_filename), CG_MODE_READ, file_id, ierr_local)
+        CALL check_cgns_error(ierr_local, "cg_open_f hybrid import")
+
+        CALL cg_nbases_f(file_id, nbases_local, ierr_local)
+        CALL check_cgns_error(ierr_local, "cg_nbases_f hybrid import")
+
+        found = 0
+
+        DO base_id = 1, nbases_local
+
+            CALL cg_base_read_f(file_id, base_id, base_name_local, celldim_local, physdim_local, ierr_local)
+
+            IF (ierr_local /= CG_OK) CYCLE
+            IF (celldim_local /= 3 .OR. physdim_local /= 3) CYCLE
+
+            CALL cg_nzones_f(file_id, base_id, nzones_local, ierr_local)
+            IF (ierr_local /= CG_OK) CYCLE
+
+            DO zone_id = 1, nzones_local
+
+                isize_local = INT(0, KIND=cgsize_t)
+
+                CALL cg_zone_read_f(file_id, base_id, zone_id, zone_name_local, isize_local, ierr_local)
+                IF (ierr_local /= CG_OK) CYCLE
+
+                CALL cg_zone_type_f(file_id, base_id, zone_id, ztype, ierr_local)
+                IF (ierr_local /= CG_OK) CYCLE
+
+                IF (ztype == Unstructured .AND. isize_local(1,1) > 0 .AND. isize_local(2,1) > 0) THEN
+                    found = 1
+                    CALL copy_zone_coordinates_and_sections( &
+                        file_id, base_id, zone_id, &
+                        out_file_id, out_base_id, out_zone_name, y_shift &
+                    )
+                    EXIT
+                END IF
+
+            END DO
+
+            IF (found == 1) EXIT
+
+        END DO
+
+        CALL cg_close_f(file_id, ierr_local)
+        CALL check_cgns_error(ierr_local, "cg_close_f hybrid import")
+
+        IF (found /= 1) THEN
+            PRINT *, "ERROR: no 3D unstructured zone found in hybrid Block6 file: ", TRIM(hybrid_filename)
+            STOP 1
+        END IF
+
+    END SUBROUTINE import_first_unstructured_zone_as
+
+
+    INTEGER FUNCTION supported_element_node_count(element_type)
+
+        USE cgns
+        IMPLICIT NONE
+
+        INTEGER, INTENT(IN) :: element_type
+
+        SELECT CASE (element_type)
+        CASE (TETRA_4)
+            supported_element_node_count = 4
+        CASE (PYRA_5)
+            supported_element_node_count = 5
+        CASE (HEXA_8)
+            supported_element_node_count = 8
+        CASE (QUAD_4)
+            supported_element_node_count = 4
+        CASE (TRI_3)
+            supported_element_node_count = 3
+        CASE DEFAULT
+            supported_element_node_count = -1
+        END SELECT
+
+    END FUNCTION supported_element_node_count
+
+
+    SUBROUTINE check_cgns_error(ierr, where)
+
+        USE cgns
+        IMPLICIT NONE
+
+        INTEGER, INTENT(IN) :: ierr
+        CHARACTER(LEN=*), INTENT(IN) :: where
+
+        IF (ierr /= CG_OK) THEN
+            PRINT *, "CGNS ERROR at: ", TRIM(where)
+            CALL cg_error_print_f()
+            STOP 1
+        END IF
+
+    END SUBROUTINE check_cgns_error
+
+
+END PROGRAM stitch_nine_block_with_hybrid_block6
