@@ -1,0 +1,4107 @@
+PROGRAM block6_structured_yheight_patch_conformal_hybrid_fill
+
+!------------------------------------------------------------------------------
+! Block 6 hybrid mesh generator.
+!
+! Reads Block 6 from the existing nine-block mesh, applies the roughness patch,
+! and writes the hybrid Block 6 CGNS file.
+!------------------------------------------------------------------------------
+
+    USE cgns
+    IMPLICIT NONE
+
+    ! Read the Block 6 outer boundary from the current nine-block mesh.
+    LOGICAL, PARAMETER :: read_block6_outer_from_nine_block_cgns = .TRUE.
+    CHARACTER(LEN=*), PARAMETER :: base_mesh_file = "nine_block.cgns"
+    CHARACTER(LEN=*), PARAMETER :: base_block6_zone_name = "Block6"
+
+    ! Use the original Block 6 j-spacing where possible.
+    LOGICAL, PARAMETER :: use_base_block6_j_spacing_for_hybrid = .TRUE.
+
+    ! Straighten the main radial lines, leaving the side regions alone.
+    LOGICAL, PARAMETER :: hybrid_block6_straighten_middle_radial_lines_enabled = .TRUE.
+    INTEGER, PARAMETER :: hybrid_block6_straighten_protect_i_lines = 6
+    REAL(8), PARAMETER :: hybrid_block6_straighten_relax = 1.0D0
+
+    ! Place straightened points using the original Block 6 spacing fractions.
+    LOGICAL, PARAMETER :: hybrid_block6_straighten_use_base_j_spacing = .TRUE.
+
+    ! Optional all-tet output.
+    LOGICAL, PARAMETER :: write_entire_hybrid_mesh_as_tetrahedral = .FALSE.
+
+
+    REAL(8), ALLOCATABLE :: base_block6_outer_x(:,:)
+    REAL(8), ALLOCATABLE :: base_block6_outer_y(:,:)
+    REAL(8), ALLOCATABLE :: base_block6_outer_z(:,:)
+    INTEGER :: base_block6_outer_ni
+    INTEGER :: base_block6_outer_nk
+    LOGICAL :: have_base_block6_outer
+    LOGICAL :: applied_base_block6_outer
+
+
+    CHARACTER(LEN=*), PARAMETER :: input_file  = "nine_block.cgns"
+    CHARACTER(LEN=*), PARAMETER :: output_file = "block6_structured_yheight_patch_smooth_normal_hybrid_fill.cgns"
+
+    CHARACTER(LEN=*), PARAMETER :: target_base_name = "BladeMeshBase"
+    CHARACTER(LEN=*), PARAMETER :: target_zone_name = "Block6"
+
+    ! STL roughness controls on Block 6 blade-side surface j = 1.
+    ! The STL is interpreted as a flat roughness height map:
+    !   STL local u = STL x
+    !   STL local v = STL y
+    !   STL height  = STL z - mean(STL z)
+    ! The height field is stretched over all spanwise k, but only over the
+    ! selected streamwise/arclength patch of the top blade surface.
+    CHARACTER(LEN=*), PARAMETER :: roughness_stl_file = "Thakkar2017_z_scaled_to_2mm_filtered.stl"
+    LOGICAL, PARAMETER :: subtract_best_fit_plane = .FALSE.
+    REAL(8), PARAMETER :: rough_start_fraction = 0.35D0
+    REAL(8), PARAMETER :: rough_end_fraction   = 0.55D0
+    REAL(8), PARAMETER :: stl_u_scale = 1.0D0
+    REAL(8), PARAMETER :: stl_v_scale = 1.0D0
+    REAL(8), PARAMETER :: stl_height_scale = 0.15D0
+    REAL(8), PARAMETER :: stl_height_sign = 1.0D0
+    
+
+    ! Mapping controls.
+    ! Swapped axes because this matched the STL orientation better.
+    LOGICAL, PARAMETER :: swap_stl_u_v = .FALSE.
+
+    ! Baseline debug mapping:
+    ! .FALSE. = one selected blade patch maps to one complete STL patch.
+    ! This avoids the physical-scale tiling streaks.
+    LOGICAL, PARAMETER :: preserve_stl_physical_scale = .FALSE.
+LOGICAL, PARAMETER :: use_roughness_edge_window = .TRUE.
+    LOGICAL, PARAMETER :: tile_stl_streamwise = .FALSE.
+    LOGICAL, PARAMETER :: tile_stl_spanwise = .FALSE.
+
+    ! Gaussian smoothing applied after the STL height has been mapped onto
+    ! the Block 6 blade-side surface. This smooths the applied roughness field,
+    ! not the original blade coordinates.
+    LOGICAL, PARAMETER :: use_gaussian_roughness_filter = .TRUE.
+    REAL(8), PARAMETER :: gaussian_sigma_i_nodes = 0.75D0
+    REAL(8), PARAMETER :: gaussian_sigma_k_nodes = 0.75D0
+    REAL(8), PARAMETER :: gaussian_radius_factor = 3.0D0
+
+    ! Fast-but-faithful STL search controls.
+    ! This keeps triangle/barycentric interpolation but avoids searching every
+    ! STL triangle for every blade point.
+    INTEGER, PARAMETER :: stl_search_bins_u = 250
+    INTEGER, PARAMETER :: stl_search_bins_v = 100
+    INTEGER, PARAMETER :: stl_max_triangles_per_bin = 1000
+
+    INTEGER, PARAMETER :: min_hex_layers = 1
+    INTEGER, PARAMETER :: max_hex_layers = 8
+    INTEGER, PARAMETER :: min_pyramid_layers = 1
+    INTEGER, PARAMETER :: max_pyramid_layers = 8
+    INTEGER, PARAMETER :: min_tet_cells_normal = 4
+
+    ! Procedural thickness controls.
+    ! The tetrahedral-core thickness is calculated from the measured maximum
+    ! deviation from a smoothed mean blade line, not from any user-prescribed roughness amplitude.
+    REAL(8), PARAMETER :: tet_roughness_safety_factor = 3.0D0
+    REAL(8), PARAMETER :: hex_non_tet_fraction = 0.60D0
+    INTEGER, PARAMETER :: mean_line_smooth_passes = 50
+
+    ! Enforce near-wall j-lines in the tetra/pyramid region to leave the
+    ! roughened blade surface along the ORIGINAL smooth blade-surface normal.
+    !
+    ! This changes the near-blade nodes in the generated hybrid fill before
+    ! HEX/PYRA/TET connectivity is written.
+    LOGICAL, PARAMETER :: enforce_blade_normal_gridlines = .TRUE.
+
+    ! Enforce the j-lines to be normal at the roughened blade wall, but do
+    ! not squeeze the tangential recovery into only a few near-wall layers.
+    !
+    ! Instead, blend smoothly all the way to the pyramid transition layer.
+    ! This removes the visible near-wall waviness/kink while keeping:
+    !     dR/dj at j=1 parallel to the original smooth blade normal.
+    LOGICAL, PARAMETER :: blade_normal_blend_to_pyramid_layer = .TRUE.
+
+    ! Fallback only used if blade_normal_blend_to_pyramid_layer = .FALSE.
+    INTEGER, PARAMETER :: blade_normal_enforced_cell_layers = 8
+
+    INTEGER :: nhex_layers
+    INTEGER :: npyramid_layers
+
+    INTEGER, PARAMETER :: FACE_IMIN = 1
+    INTEGER, PARAMETER :: FACE_IMAX = 2
+    INTEGER, PARAMETER :: FACE_JMIN = 3
+    INTEGER, PARAMETER :: FACE_JMAX = 4
+    INTEGER, PARAMETER :: FACE_KMIN = 5
+    INTEGER, PARAMETER :: FACE_KMAX = 6
+
+    INTEGER :: ierr
+    INTEGER :: in_file_id, in_base_id, in_zone_id
+    INTEGER :: out_file_id, out_base_id, out_zone_id
+    INTEGER :: coord_id, hex_section_id, pyr_section_id, tet_section_id
+
+    CHARACTER(LEN=128) :: base_name, zone_name
+    INTEGER :: cell_dim, phys_dim
+
+    INTEGER :: ni, nj, nk
+    INTEGER :: nc_i, nc_j, nc_k
+    INTEGER :: n_original_nodes, n_center_nodes, n_total_nodes
+    INTEGER :: nhex, npyr_source, npyr, ntet_source, ntet
+    INTEGER :: ninterface_faces, ninterface_tets
+    INTEGER :: n_pyra_faces, n_bisected_faces
+    INTEGER :: i, j, k, id
+    INTEGER :: ehex, epyr, centre_id
+    INTEGER :: n000, n100, n110, n010, n001, n101, n111, n011
+    REAL(8) :: xc, yc, zc
+
+    INTEGER(KIND=cgsize_t) :: structured_isize(3,3)
+    INTEGER(KIND=cgsize_t) :: unstructured_isize(3)
+    INTEGER(KIND=cgsize_t) :: rmin(3), rmax(3)
+    INTEGER(KIND=cgsize_t) :: hex_start, hex_end, pyr_start, pyr_end, tet_start, tet_end
+
+    REAL(8), ALLOCATABLE :: xold(:,:,:), yold(:,:,:), zold(:,:,:)
+    REAL(8), ALLOCATABLE :: xbase_block6(:,:,:), ybase_block6(:,:,:), zbase_block6(:,:,:)
+    REAL(8), ALLOCATABLE :: xg(:,:,:), yg(:,:,:), zg(:,:,:)
+
+    ! Stored before applying roughness.
+    ! These are normals of the original smooth Block 6 blade surface j=1.
+    ! Later, the roughened wall point is used as the base point, but these
+    ! original normals are used as the near-wall grid-line direction.
+    REAL(8), ALLOCATABLE :: original_blade_nx(:,:)
+    REAL(8), ALLOCATABLE :: original_blade_ny(:,:)
+    LOGICAL :: original_blade_normals_available = .FALSE.
+    REAL(8), ALLOCATABLE :: xu(:), yu(:), zu(:)
+
+    INTEGER, ALLOCATABLE :: centre_node_id(:,:,:)
+    INTEGER(KIND=cgsize_t), ALLOCATABLE :: hex_conn(:), pyr_conn(:), tet_conn(:)
+
+    ! Read structured Block 6.
+    CALL cg_open_f(input_file, CG_MODE_READ, in_file_id, ierr)
+    CALL check_cgns_error(ierr, "cg_open_f input")
+
+    CALL find_base_and_zone( &
+        in_file_id, target_base_name, target_zone_name, &
+        in_base_id, in_zone_id &
+    )
+
+    CALL cg_base_read_f(in_file_id, in_base_id, base_name, cell_dim, phys_dim, ierr)
+    CALL check_cgns_error(ierr, "cg_base_read_f input")
+
+    CALL cg_zone_read_f(in_file_id, in_base_id, in_zone_id, zone_name, structured_isize, ierr)
+    CALL check_cgns_error(ierr, "cg_zone_read_f input")
+
+    ni = INT(structured_isize(1,1))
+    nj = INT(structured_isize(2,1))
+    nk = INT(structured_isize(3,1))
+
+    nc_i = ni - 1
+    nc_j = nj - 1
+    nc_k = nk - 1
+
+    IF (ni < 2*max_hex_layers + 2*max_pyramid_layers + 3 .OR. nj < max_hex_layers + max_pyramid_layers + min_tet_cells_normal + 2 .OR. nk < 2) THEN
+        PRINT *, "ERROR: Block 6 too small for requested 5-layer shell."
+        PRINT *, "ni,nj,nk = ", ni, nj, nk
+        STOP 1
+    END IF
+
+    PRINT *, "Input base: ", TRIM(base_name)
+    PRINT *, "Input zone: ", TRIM(zone_name)
+    PRINT *, "Node dimensions ni,nj,nk = ", ni, nj, nk
+    PRINT *, "Cell dimensions nc_i,nc_j,nc_k = ", nc_i, nc_j, nc_k
+    PRINT *, "Blade-side surface is j = 1."
+    PRINT *, "Spanwise direction is k."
+
+    ALLOCATE(xold(ni,nj,nk), yold(ni,nj,nk), zold(ni,nj,nk))
+
+    rmin = INT(1, KIND=cgsize_t)
+    rmax(1) = INT(ni, KIND=cgsize_t)
+    rmax(2) = INT(nj, KIND=cgsize_t)
+    rmax(3) = INT(nk, KIND=cgsize_t)
+
+    CALL cg_coord_read_f(in_file_id, in_base_id, in_zone_id, &
+        "CoordinateX", RealDouble, rmin, rmax, xold, ierr)
+    CALL check_cgns_error(ierr, "cg_coord_read_f CoordinateX")
+
+    CALL cg_coord_read_f(in_file_id, in_base_id, in_zone_id, &
+        "CoordinateY", RealDouble, rmin, rmax, yold, ierr)
+    CALL check_cgns_error(ierr, "cg_coord_read_f CoordinateY")
+
+    CALL cg_coord_read_f(in_file_id, in_base_id, in_zone_id, &
+        "CoordinateZ", RealDouble, rmin, rmax, zold, ierr)
+    CALL check_cgns_error(ierr, "cg_coord_read_f CoordinateZ")
+
+    CALL cg_close_f(in_file_id, ierr)
+    CALL check_cgns_error(ierr, "cg_close_f input")
+
+    PRINT *, "Input file closed. It was only opened in CG_MODE_READ."
+
+    ! Preserve the original smooth Block 6 coordinates from nine_block.cgns.
+    ! These are used later to impose the original j-cell-height distribution
+    ! on the generated hybrid mesh.
+    ALLOCATE(xbase_block6(ni,nj,nk), ybase_block6(ni,nj,nk), zbase_block6(ni,nj,nk))
+    xbase_block6 = xold
+    ybase_block6 = yold
+    zbase_block6 = zold
+
+    ! Modify only Block 6 blade-side surface j = 1 using the STL roughness.
+    ! All other Block 6 coordinates remain as read from the full mesh.
+    CALL apply_stl_roughness_to_blade_surface_inplace(xold, yold, zold)
+
+    CALL calculate_procedural_layer_counts( &
+        xold, yold, zold, nhex_layers, npyramid_layers &
+    )
+
+    ! Build generated global coordinates.
+    ALLOCATE(xg(ni,nj,nk), yg(ni,nj,nk), zg(ni,nj,nk))
+
+    have_base_block6_outer = .FALSE.
+
+    IF (read_block6_outer_from_nine_block_cgns) THEN
+        CALL read_block6_outer_surface_from_cgns( &
+            base_mesh_file, base_block6_zone_name, &
+            base_block6_outer_x, base_block6_outer_y, base_block6_outer_z, &
+            base_block6_outer_ni, base_block6_outer_nk, have_base_block6_outer &
+        )
+
+        IF (have_base_block6_outer) THEN
+            PRINT *, "Using Block6 j=nj outer surface extracted from ", TRIM(base_mesh_file)
+            PRINT *, "  outer surface ni, nk = ", base_block6_outer_ni, base_block6_outer_nk
+        ELSE
+            PRINT *, "WARNING: could not extract Block6 outer surface from ", TRIM(base_mesh_file)
+            PRINT *, "         falling back to existing internally generated outer boundary."
+        END IF
+    END IF
+
+    CALL build_generated_coordinates(xold, yold, zold, xg, yg, zg)
+
+    ! Re-apply the exact Block6 j=nj outer surface extracted from nine_block.cgns
+    ! as the fixed outer boundary of the generated hybrid Block 6 mesh.
+    !
+    ! This is  done AFTER build_generated_coordinates, because that
+    ! routine may redistribute the interior/outer rows.  The outer interface
+    ! must be re-locked to the actual current nine_block.cgns Block6 boundary.
+    IF (have_base_block6_outer) THEN
+        CALL apply_extracted_block6_outer_to_hybrid_boundary( &
+            base_block6_outer_x, base_block6_outer_y, base_block6_outer_z, &
+            base_block6_outer_ni, base_block6_outer_nk, &
+            xg, yg, zg, applied_base_block6_outer &
+        )
+
+        IF (applied_base_block6_outer) THEN
+            PRINT *, "Applied extracted nine_block.cgns Block6 j=nj surface to hybrid outer boundary."
+        ELSE
+            PRINT *, "WARNING: extracted Block6 outer surface was available but not applied."
+        END IF
+    END IF
+
+    IF (use_base_block6_j_spacing_for_hybrid) THEN
+        CALL redistribute_hybrid_j_lines_to_base_block6_spacing( &
+            xbase_block6, ybase_block6, zbase_block6, &
+            xg, yg, zg &
+        )
+        PRINT *, "Redistributed hybrid j-lines using original nine_block.cgns Block6 cell heights."
+    END IF
+
+    IF (hybrid_block6_straighten_middle_radial_lines_enabled) THEN
+        CALL straighten_hybrid_block6_middle_radial_lines( &
+            xbase_block6, ybase_block6, zbase_block6, &
+            xg, yg, zg &
+        )
+        PRINT *, "Straightened middle radial j-lines in hybrid Block 6."
+    END IF
+
+    PRINT *, "Generated 5-layer shell coordinates and redistributed pyramid-fill coordinates."
+    PRINT *, "Original-blade-normal j-line enforcement enabled = ", enforce_blade_normal_gridlines
+    PRINT *, "Original-blade-normal blend to pyramid layer = ", blade_normal_blend_to_pyramid_layer
+    PRINT *, "Original-blade-normal fallback enforced cell layers = ", blade_normal_enforced_cell_layers
+
+    IF (write_entire_hybrid_mesh_as_tetrahedral) THEN
+        PRINT *, "All-tetrahedral output enabled."
+        PRINT *, "Writing every generated logical Block 6 cell as 6 TETRA_4 cells."
+        CALL write_all_tetrahedral_hybrid_block6( &
+            output_file, xg, yg, zg, ni, nj, nk &
+        )
+
+        DEALLOCATE(xold,yold,zold,xg,yg,zg)
+        IF (ALLOCATED(xbase_block6)) DEALLOCATE(xbase_block6,ybase_block6,zbase_block6)
+        IF (ALLOCATED(base_block6_outer_x)) DEALLOCATE(base_block6_outer_x,base_block6_outer_y,base_block6_outer_z)
+
+        PRINT *, "Wrote all-tetrahedral hybrid Block 6 mesh: ", TRIM(output_file)
+        STOP
+    END IF
+
+    ! Count cells.
+    !
+    ! Count the mixed cells and the interface tets.
+    nhex = 0
+    npyr_source = 0
+    npyr = 0
+    ntet_source = 0
+    ninterface_faces = 0
+    ninterface_tets = 0
+
+    DO k = 1, nc_k
+        DO j = 1, nc_j
+            DO i = 1, nc_i
+                IF (keep_hex_cell(i, j, nc_i, nc_j)) THEN
+                    nhex = nhex + 1
+                ELSE IF (keep_pyramid_cell(i, j, nc_i, nc_j)) THEN
+                    npyr_source = npyr_source + 1
+                    CALL count_pyramid_face_types(i,j,k,nc_i,nc_j,nc_k, &
+                        n_pyra_faces, n_bisected_faces)
+                    npyr = npyr + n_pyra_faces
+                    ninterface_faces = ninterface_faces + n_bisected_faces
+                ELSE
+                    ntet_source = ntet_source + 1
+                END IF
+            END DO
+        END DO
+    END DO
+
+    ninterface_tets = 2*ninterface_faces
+    ntet = 6*ntet_source + ninterface_tets
+
+    PRINT *, "HEXA_8 shell cells = ", nhex
+    PRINT *, "Pyramid source cells = ", npyr_source
+    PRINT *, "PYRA_5 cells after interface splitting = ", npyr
+    PRINT *, "Pyramid faces bisected into interface TETRA_4 = ", ninterface_faces
+    PRINT *, "Interface TETRA_4 cells = ", ninterface_tets
+    PRINT *, "Tetra source cells = ", ntet_source
+    PRINT *, "TETRA_4 cells: core 6/cell plus interface split = ", ntet
+
+    n_original_nodes = ni*nj*nk
+    n_center_nodes = npyr_source
+
+    ! Tets use the existing cell vertices only.
+    n_total_nodes = n_original_nodes + n_center_nodes
+
+    ALLOCATE(xu(n_total_nodes), yu(n_total_nodes), zu(n_total_nodes))
+    ALLOCATE(centre_node_id(nc_i,nc_j,nc_k))
+    centre_node_id = 0
+
+    ! Flatten generated grid nodes.
+    DO k = 1, nk
+        DO j = 1, nj
+            DO i = 1, ni
+                id = node_id(i,j,k,ni,nj)
+                xu(id) = xg(i,j,k)
+                yu(id) = yg(i,j,k)
+                zu(id) = zg(i,j,k)
+            END DO
+        END DO
+    END DO
+
+    ! Add centre nodes for the pyramid cells.
+    centre_id = n_original_nodes
+
+    DO k = 1, nc_k
+        DO j = 1, nc_j
+            DO i = 1, nc_i
+                IF (keep_hex_cell(i, j, nc_i, nc_j)) CYCLE
+                IF (.NOT. keep_pyramid_cell(i, j, nc_i, nc_j)) CYCLE
+
+                CALL get_hex_corner_nodes(i,j,k,ni,nj, &
+                    n000,n100,n110,n010,n001,n101,n111,n011)
+
+                xc = (xu(n000)+xu(n100)+xu(n110)+xu(n010)+ &
+                      xu(n001)+xu(n101)+xu(n111)+xu(n011))/8.0D0
+                yc = (yu(n000)+yu(n100)+yu(n110)+yu(n010)+ &
+                      yu(n001)+yu(n101)+yu(n111)+yu(n011))/8.0D0
+                zc = (zu(n000)+zu(n100)+zu(n110)+zu(n010)+ &
+                      zu(n001)+zu(n101)+zu(n111)+zu(n011))/8.0D0
+
+                centre_id = centre_id + 1
+                xu(centre_id) = xc
+                yu(centre_id) = yc
+                zu(centre_id) = zc
+                centre_node_id(i,j,k) = centre_id
+            END DO
+        END DO
+    END DO
+
+    IF (centre_id /= n_total_nodes) THEN
+        PRINT *, "ERROR: pyramid centre node count mismatch."
+        PRINT *, "centre_id, n_total_nodes = ", centre_id, n_total_nodes
+        STOP 1
+    END IF
+
+    PRINT *, "Total unstructured nodes = ", n_total_nodes
+    PRINT *, "Pyramid centre nodes = ", n_center_nodes
+    PRINT *, "Extra tetra nodes = 0 for Freudenthal decomposition."
+
+    ! Hex connectivity.
+    ALLOCATE(hex_conn(8*nhex))
+    ehex = 0
+
+    DO k = 1, nc_k
+        DO j = 1, nc_j
+            DO i = 1, nc_i
+                IF (.NOT. keep_hex_cell(i, j, nc_i, nc_j)) CYCLE
+
+                ehex = ehex + 1
+
+                CALL get_hex_corner_nodes(i,j,k,ni,nj, &
+                    n000,n100,n110,n010,n001,n101,n111,n011)
+
+                hex_conn(8*ehex-7) = INT(n000, KIND=cgsize_t)
+                hex_conn(8*ehex-6) = INT(n100, KIND=cgsize_t)
+                hex_conn(8*ehex-5) = INT(n110, KIND=cgsize_t)
+                hex_conn(8*ehex-4) = INT(n010, KIND=cgsize_t)
+                hex_conn(8*ehex-3) = INT(n001, KIND=cgsize_t)
+                hex_conn(8*ehex-2) = INT(n101, KIND=cgsize_t)
+                hex_conn(8*ehex-1) = INT(n111, KIND=cgsize_t)
+                hex_conn(8*ehex)   = INT(n011, KIND=cgsize_t)
+            END DO
+        END DO
+    END DO
+
+    ! Pyramid and interface-tet connectivity.
+    ALLOCATE(pyr_conn(5*npyr))
+    ALLOCATE(tet_conn(4*ntet))
+    epyr = 0
+    id = 0   ! Re-used here as the running tetra element counter.
+
+    DO k = 1, nc_k
+        DO j = 1, nc_j
+            DO i = 1, nc_i
+                IF (keep_hex_cell(i, j, nc_i, nc_j)) CYCLE
+                IF (.NOT. keep_pyramid_cell(i, j, nc_i, nc_j)) CYCLE
+
+                centre_id = centre_node_id(i,j,k)
+
+                CALL get_hex_corner_nodes(i,j,k,ni,nj, &
+                    n000,n100,n110,n010,n001,n101,n111,n011)
+
+                ! Split face-pyramids where they touch the tet core.
+                CALL add_pyramid_or_interface_tets( &
+                    pyr_conn, epyr, tet_conn, id, &
+                    FACE_KMIN, face_touches_tet(i,j,k,FACE_KMIN,nc_i,nc_j,nc_k), &
+                    n000, n100, n110, n010, centre_id)
+
+                CALL add_pyramid_or_interface_tets( &
+                    pyr_conn, epyr, tet_conn, id, &
+                    FACE_KMAX, face_touches_tet(i,j,k,FACE_KMAX,nc_i,nc_j,nc_k), &
+                    n001, n011, n111, n101, centre_id)
+
+                CALL add_pyramid_or_interface_tets( &
+                    pyr_conn, epyr, tet_conn, id, &
+                    FACE_IMIN, face_touches_tet(i,j,k,FACE_IMIN,nc_i,nc_j,nc_k), &
+                    n000, n010, n011, n001, centre_id)
+
+                CALL add_pyramid_or_interface_tets( &
+                    pyr_conn, epyr, tet_conn, id, &
+                    FACE_IMAX, face_touches_tet(i,j,k,FACE_IMAX,nc_i,nc_j,nc_k), &
+                    n100, n101, n111, n110, centre_id)
+
+                CALL add_pyramid_or_interface_tets( &
+                    pyr_conn, epyr, tet_conn, id, &
+                    FACE_JMIN, face_touches_tet(i,j,k,FACE_JMIN,nc_i,nc_j,nc_k), &
+                    n000, n001, n101, n100, centre_id)
+
+                CALL add_pyramid_or_interface_tets( &
+                    pyr_conn, epyr, tet_conn, id, &
+                    FACE_JMAX, face_touches_tet(i,j,k,FACE_JMAX,nc_i,nc_j,nc_k), &
+                    n010, n110, n111, n011, centre_id)
+            END DO
+        END DO
+    END DO
+
+    IF (epyr /= npyr) THEN
+        PRINT *, "ERROR: pyramid count mismatch."
+        PRINT *, "epyr, npyr = ", epyr, npyr
+        STOP 1
+    END IF
+
+    IF (id /= ninterface_tets) THEN
+        PRINT *, "ERROR: interface-tet count mismatch before core tets."
+        PRINT *, "id, ninterface_tets = ", id, ninterface_tets
+        STOP 1
+    END IF
+
+    ! Tetra connectivity for the remaining interior after the pyramid/interface layer.
+    CALL build_tet_connectivity(tet_conn, id, ntet, ni, nj, nk, nc_i, nc_j, nc_k)
+
+    PRINT *, "Built conformal PYRA/TETRA interface and Freudenthal TETRA_4 core."
+
+    ! Write output.
+    CALL cg_open_f(output_file, CG_MODE_WRITE, out_file_id, ierr)
+    CALL check_cgns_error(ierr, "cg_open_f output")
+
+    CALL cg_base_write_f(out_file_id, "Block6StructuredYHeightPatchConformalHybridFillBase", 3, 3, out_base_id, ierr)
+    CALL check_cgns_error(ierr, "cg_base_write_f output")
+
+    unstructured_isize(1) = INT(n_total_nodes, KIND=cgsize_t)
+    unstructured_isize(2) = INT(nhex + npyr + ntet, KIND=cgsize_t)
+    unstructured_isize(3) = INT(0, KIND=cgsize_t)
+
+    CALL cg_zone_write_f(out_file_id, out_base_id, &
+        "Block6_STLSwappedFullPatchDebug_ConformalHybridFill", unstructured_isize, &
+        Unstructured, out_zone_id, ierr)
+    CALL check_cgns_error(ierr, "cg_zone_write_f output")
+
+    CALL cg_coord_write_f(out_file_id, out_base_id, out_zone_id, RealDouble, &
+        "CoordinateX", xu, coord_id, ierr)
+    CALL check_cgns_error(ierr, "cg_coord_write_f X")
+
+    CALL cg_coord_write_f(out_file_id, out_base_id, out_zone_id, RealDouble, &
+        "CoordinateY", yu, coord_id, ierr)
+    CALL check_cgns_error(ierr, "cg_coord_write_f Y")
+
+    CALL cg_coord_write_f(out_file_id, out_base_id, out_zone_id, RealDouble, &
+        "CoordinateZ", zu, coord_id, ierr)
+    CALL check_cgns_error(ierr, "cg_coord_write_f Z")
+
+    hex_start = INT(1, KIND=cgsize_t)
+    hex_end = INT(nhex, KIND=cgsize_t)
+
+    CALL cg_section_write_f(out_file_id, out_base_id, out_zone_id, &
+        "Hex5LayerShellCells", HEXA_8, hex_start, hex_end, &
+        0, hex_conn, hex_section_id, ierr)
+    CALL check_cgns_error(ierr, "cg_section_write_f Hex5LayerShellCells")
+
+    pyr_start = hex_end + INT(1, KIND=cgsize_t)
+    pyr_end = hex_end + INT(npyr, KIND=cgsize_t)
+
+    CALL cg_section_write_f(out_file_id, out_base_id, out_zone_id, &
+        "PyramidCells_ConformalFaces", PYRA_5, pyr_start, pyr_end, &
+        0, pyr_conn, pyr_section_id, ierr)
+    CALL check_cgns_error(ierr, "cg_section_write_f PyramidCells_ConformalFaces")
+
+    tet_start = pyr_end + INT(1, KIND=cgsize_t)
+    tet_end = pyr_end + INT(ntet, KIND=cgsize_t)
+
+    CALL cg_section_write_f(out_file_id, out_base_id, out_zone_id, &
+        "TetraCells_InterfacePlusFreudenthal6", TETRA_4, tet_start, tet_end, &
+        0, tet_conn, tet_section_id, ierr)
+    CALL check_cgns_error(ierr, "cg_section_write_f TetraCells_InterfacePlusFreudenthal6")
+
+    CALL write_blade_surface_check(out_file_id, xu, yu, zu, ni, nj, nk)
+
+    CALL cg_close_f(out_file_id, ierr)
+    CALL check_cgns_error(ierr, "cg_close_f output")
+
+    PRINT *, "Wrote: ", TRIM(output_file)
+
+    DEALLOCATE(xold,yold,zold,xg,yg,zg,xu,yu,zu)
+    DEALLOCATE(centre_node_id,hex_conn,pyr_conn,tet_conn)
+    IF (ALLOCATED(xbase_block6)) DEALLOCATE(xbase_block6,ybase_block6,zbase_block6)
+    IF (ALLOCATED(base_block6_outer_x)) DEALLOCATE(base_block6_outer_x,base_block6_outer_y,base_block6_outer_z)
+
+CONTAINS
+
+
+    SUBROUTINE read_block6_outer_surface_from_cgns( &
+        filename, zone_name_target, xouter, youter, zouter, ni_out, nk_out, success &
+    )
+
+        ! Read Block 6 and extract its j=nj boundary.
+
+        USE cgns
+        IMPLICIT NONE
+
+        CHARACTER(LEN=*), INTENT(IN) :: filename
+        CHARACTER(LEN=*), INTENT(IN) :: zone_name_target
+
+        REAL(8), ALLOCATABLE, INTENT(OUT) :: xouter(:,:)
+        REAL(8), ALLOCATABLE, INTENT(OUT) :: youter(:,:)
+        REAL(8), ALLOCATABLE, INTENT(OUT) :: zouter(:,:)
+
+        INTEGER, INTENT(OUT) :: ni_out
+        INTEGER, INTENT(OUT) :: nk_out
+        LOGICAL, INTENT(OUT) :: success
+
+        INTEGER :: ierr
+        INTEGER :: file_id
+        INTEGER :: nbases
+        INTEGER :: base_id
+        INTEGER :: nzones
+        INTEGER :: zone_id
+        INTEGER :: celldim
+        INTEGER :: physdim
+        INTEGER :: ztype
+        INTEGER :: i
+        INTEGER :: k
+        INTEGER :: coord_id
+
+        CHARACTER(LEN=64) :: basename
+        CHARACTER(LEN=64) :: zname
+
+        INTEGER(KIND=cgsize_t) :: isize3(3,3)
+        INTEGER(KIND=cgsize_t) :: isize2(2,3)
+        INTEGER(KIND=cgsize_t) :: rmin3(3)
+        INTEGER(KIND=cgsize_t) :: rmax3(3)
+        INTEGER(KIND=cgsize_t) :: rmin2(2)
+        INTEGER(KIND=cgsize_t) :: rmax2(2)
+
+        INTEGER :: ni
+        INTEGER :: nj
+        INTEGER :: nk
+
+        REAL(8), ALLOCATABLE :: x3(:,:,:)
+        REAL(8), ALLOCATABLE :: y3(:,:,:)
+        REAL(8), ALLOCATABLE :: z3(:,:,:)
+
+        REAL(8), ALLOCATABLE :: x2(:,:)
+        REAL(8), ALLOCATABLE :: y2(:,:)
+        REAL(8), ALLOCATABLE :: z2(:,:)
+
+        success = .FALSE.
+        ni_out = 0
+        nk_out = 0
+
+        IF (ALLOCATED(xouter)) DEALLOCATE(xouter)
+        IF (ALLOCATED(youter)) DEALLOCATE(youter)
+        IF (ALLOCATED(zouter)) DEALLOCATE(zouter)
+
+        CALL cg_open_f(TRIM(filename), CG_MODE_READ, file_id, ierr)
+        IF (ierr /= CG_OK) THEN
+            PRINT *, "WARNING: cg_open_f failed for base mesh file: ", TRIM(filename)
+            RETURN
+        END IF
+
+        CALL cg_nbases_f(file_id, nbases, ierr)
+        IF (ierr /= CG_OK) THEN
+            CALL cg_close_f(file_id, ierr)
+            RETURN
+        END IF
+
+        DO base_id = 1, nbases
+
+            CALL cg_base_read_f(file_id, base_id, basename, celldim, physdim, ierr)
+            IF (ierr /= CG_OK) CYCLE
+
+            CALL cg_nzones_f(file_id, base_id, nzones, ierr)
+            IF (ierr /= CG_OK) CYCLE
+
+            DO zone_id = 1, nzones
+
+                ! First try structured 3D size read.
+                isize3 = 0
+                CALL cg_zone_read_f(file_id, base_id, zone_id, zname, isize3, ierr)
+                IF (ierr /= CG_OK) CYCLE
+
+                IF (TRIM(zname) /= TRIM(zone_name_target)) CYCLE
+
+                CALL cg_zone_type_f(file_id, base_id, zone_id, ztype, ierr)
+                IF (ierr /= CG_OK) CYCLE
+
+                IF (ztype /= Structured) THEN
+                    PRINT *, "WARNING: target Block6 zone is not Structured; cannot extract j=nj surface."
+                    CALL cg_close_f(file_id, ierr)
+                    RETURN
+                END IF
+
+                IF (celldim == 3) THEN
+
+                    ni = INT(isize3(1,1))
+                    nj = INT(isize3(2,1))
+                    nk = INT(isize3(3,1))
+
+                    IF (ni < 2 .OR. nj < 2 .OR. nk < 1) THEN
+                        CALL cg_close_f(file_id, ierr)
+                        RETURN
+                    END IF
+
+                    ALLOCATE(x3(ni,nj,nk), y3(ni,nj,nk), z3(ni,nj,nk))
+
+                    rmin3 = INT(1, KIND=cgsize_t)
+                    rmax3(1) = INT(ni, KIND=cgsize_t)
+                    rmax3(2) = INT(nj, KIND=cgsize_t)
+                    rmax3(3) = INT(nk, KIND=cgsize_t)
+
+                    CALL cg_coord_read_f(file_id, base_id, zone_id, "CoordinateX", RealDouble, rmin3, rmax3, x3, ierr)
+                    IF (ierr /= CG_OK) THEN
+                        DEALLOCATE(x3,y3,z3)
+                        CALL cg_close_f(file_id, ierr)
+                        RETURN
+                    END IF
+
+                    CALL cg_coord_read_f(file_id, base_id, zone_id, "CoordinateY", RealDouble, rmin3, rmax3, y3, ierr)
+                    IF (ierr /= CG_OK) THEN
+                        DEALLOCATE(x3,y3,z3)
+                        CALL cg_close_f(file_id, ierr)
+                        RETURN
+                    END IF
+
+                    CALL cg_coord_read_f(file_id, base_id, zone_id, "CoordinateZ", RealDouble, rmin3, rmax3, z3, ierr)
+                    IF (ierr /= CG_OK) THEN
+                        z3 = 0.0D0
+                    END IF
+
+                    ALLOCATE(xouter(ni,nk), youter(ni,nk), zouter(ni,nk))
+
+                    DO k = 1, nk
+                        DO i = 1, ni
+                            xouter(i,k) = x3(i,nj,k)
+                            youter(i,k) = y3(i,nj,k)
+                            zouter(i,k) = z3(i,nj,k)
+                        END DO
+                    END DO
+
+                    DEALLOCATE(x3,y3,z3)
+
+                    ni_out = ni
+                    nk_out = nk
+                    success = .TRUE.
+
+                    CALL cg_close_f(file_id, ierr)
+                    RETURN
+
+                ELSE IF (celldim == 2) THEN
+
+                    ! cg_zone_read_f uses different rank for 2D structured zones
+                    ! in strict interfaces, but most CGNS Fortran builds accept
+                    ! the leading 2 rows of isize3.  Interpret that here.
+                    ni = INT(isize3(1,1))
+                    nj = INT(isize3(2,1))
+                    nk = 1
+
+                    IF (ni < 2 .OR. nj < 2) THEN
+                        CALL cg_close_f(file_id, ierr)
+                        RETURN
+                    END IF
+
+                    ALLOCATE(x2(ni,nj), y2(ni,nj), z2(ni,nj))
+
+                    rmin2 = INT(1, KIND=cgsize_t)
+                    rmax2(1) = INT(ni, KIND=cgsize_t)
+                    rmax2(2) = INT(nj, KIND=cgsize_t)
+
+                    CALL cg_coord_read_f(file_id, base_id, zone_id, "CoordinateX", RealDouble, rmin2, rmax2, x2, ierr)
+                    IF (ierr /= CG_OK) THEN
+                        DEALLOCATE(x2,y2,z2)
+                        CALL cg_close_f(file_id, ierr)
+                        RETURN
+                    END IF
+
+                    CALL cg_coord_read_f(file_id, base_id, zone_id, "CoordinateY", RealDouble, rmin2, rmax2, y2, ierr)
+                    IF (ierr /= CG_OK) THEN
+                        DEALLOCATE(x2,y2,z2)
+                        CALL cg_close_f(file_id, ierr)
+                        RETURN
+                    END IF
+
+                    CALL cg_coord_read_f(file_id, base_id, zone_id, "CoordinateZ", RealDouble, rmin2, rmax2, z2, ierr)
+                    IF (ierr /= CG_OK) THEN
+                        z2 = 0.0D0
+                    END IF
+
+                    ALLOCATE(xouter(ni,1), youter(ni,1), zouter(ni,1))
+
+                    DO i = 1, ni
+                        xouter(i,1) = x2(i,nj)
+                        youter(i,1) = y2(i,nj)
+                        zouter(i,1) = z2(i,nj)
+                    END DO
+
+                    DEALLOCATE(x2,y2,z2)
+
+                    ni_out = ni
+                    nk_out = 1
+                    success = .TRUE.
+
+                    CALL cg_close_f(file_id, ierr)
+                    RETURN
+
+                ELSE
+                    PRINT *, "WARNING: unsupported Block6 base cell dimension: ", celldim
+                    CALL cg_close_f(file_id, ierr)
+                    RETURN
+                END IF
+
+            END DO
+
+        END DO
+
+        PRINT *, "WARNING: zone not found in base mesh file: ", TRIM(zone_name_target)
+        CALL cg_close_f(file_id, ierr)
+
+    END SUBROUTINE read_block6_outer_surface_from_cgns
+
+
+    SUBROUTINE apply_extracted_block6_outer_to_hybrid_boundary( &
+        xouter, youter, zouter, ni_outer, nk_outer, &
+        xhyb, yhyb, zhyb, applied &
+    )
+
+        ! Apply extracted Block6 j=nj surface as the fixed outer boundary of a
+        ! hybrid Block 6 mesh array.
+        !
+        ! Expected hybrid convention:
+        !   xhyb(i,j,k), yhyb(i,j,k), zhyb(i,j,k)
+        !   outer/top boundary is j = SIZE(xhyb,2)
+        !
+        ! If spanwise count differs, nearest-neighbour mapping in k is used.
+        ! If i count differs, nearest-neighbour mapping in i is used.
+        ! This keeps the routine robust while preserving exact values when the
+        ! dimensions match.
+
+        IMPLICIT NONE
+
+        REAL(8), INTENT(IN) :: xouter(:,:)
+        REAL(8), INTENT(IN) :: youter(:,:)
+        REAL(8), INTENT(IN) :: zouter(:,:)
+        INTEGER, INTENT(IN) :: ni_outer
+        INTEGER, INTENT(IN) :: nk_outer
+
+        REAL(8), INTENT(INOUT) :: xhyb(:,:,:)
+        REAL(8), INTENT(INOUT) :: yhyb(:,:,:)
+        REAL(8), INTENT(INOUT) :: zhyb(:,:,:)
+
+        LOGICAL, INTENT(OUT) :: applied
+
+        INTEGER :: nih
+        INTEGER :: njh
+        INTEGER :: nkh
+        INTEGER :: i
+        INTEGER :: k
+        INTEGER :: io
+        INTEGER :: ko
+
+        applied = .FALSE.
+
+        IF (ni_outer < 1 .OR. nk_outer < 1) RETURN
+
+        nih = SIZE(xhyb,1)
+        njh = SIZE(xhyb,2)
+        nkh = SIZE(xhyb,3)
+
+        IF (nih < 1 .OR. njh < 1 .OR. nkh < 1) RETURN
+
+        DO k = 1, nkh
+
+            IF (nkh == 1) THEN
+                ko = 1
+            ELSE
+                ko = 1 + NINT(REAL(k-1,8)*REAL(nk_outer-1,8)/REAL(nkh-1,8))
+                ko = MAX(1, MIN(nk_outer, ko))
+            END IF
+
+            DO i = 1, nih
+
+                IF (nih == 1) THEN
+                    io = 1
+                ELSE
+                    io = 1 + NINT(REAL(i-1,8)*REAL(ni_outer-1,8)/REAL(nih-1,8))
+                    io = MAX(1, MIN(ni_outer, io))
+                END IF
+
+                xhyb(i,njh,k) = xouter(io,ko)
+                yhyb(i,njh,k) = youter(io,ko)
+                zhyb(i,njh,k) = zouter(io,ko)
+
+            END DO
+        END DO
+
+        applied = .TRUE.
+
+    END SUBROUTINE apply_extracted_block6_outer_to_hybrid_boundary
+
+
+    SUBROUTINE redistribute_hybrid_j_lines_to_base_block6_spacing( &
+        xbase, ybase, zbase, xhyb, yhyb, zhyb &
+    )
+
+        ! Redistribute every generated hybrid j-line so that its cell-height
+        ! distribution follows the original Block6 j-line from nine_block.cgns.
+        !
+        ! This fixes the issue where only the outer boundary j=nj is locked,
+        ! but the nodes below it still use the hybrid-fill spacing.
+        !
+        ! Method:
+        !   - For each (i,k), measure cumulative arclength fractions along the
+        !     original smooth Block6 j-line.
+        !   - Measure cumulative arclength along the current generated hybrid
+        !     j-line.
+        !   - Resample the current hybrid line at the original Block6 fractions.
+        !
+        ! Endpoints remain fixed:
+        !   j=1  = roughened blade-side point
+        !   j=nj = exact outer Block6 surface
+        !
+        ! The line shape from the hybrid generator is preserved; only the
+        ! positions of nodes along the line are changed.
+
+        IMPLICIT NONE
+
+        REAL(8), INTENT(IN)    :: xbase(:,:,:)
+        REAL(8), INTENT(IN)    :: ybase(:,:,:)
+        REAL(8), INTENT(IN)    :: zbase(:,:,:)
+        REAL(8), INTENT(INOUT) :: xhyb(:,:,:)
+        REAL(8), INTENT(INOUT) :: yhyb(:,:,:)
+        REAL(8), INTENT(INOUT) :: zhyb(:,:,:)
+
+        INTEGER :: ni
+        INTEGER :: nj
+        INTEGER :: nk
+        INTEGER :: i
+        INTEGER :: j
+        INTEGER :: k
+
+        REAL(8), ALLOCATABLE :: frac(:)
+        REAL(8), ALLOCATABLE :: shyb(:)
+        REAL(8), ALLOCATABLE :: xline(:)
+        REAL(8), ALLOCATABLE :: yline(:)
+        REAL(8), ALLOCATABLE :: zline(:)
+
+        REAL(8) :: total_base
+        REAL(8) :: total_hyb
+        REAL(8) :: target_s
+        REAL(8) :: seg
+        REAL(8) :: a
+
+        INTEGER :: jj
+
+        ni = SIZE(xhyb,1)
+        nj = SIZE(xhyb,2)
+        nk = SIZE(xhyb,3)
+
+        IF (SIZE(xbase,1) /= ni .OR. SIZE(xbase,2) /= nj .OR. SIZE(xbase,3) /= nk) THEN
+            PRINT *, "WARNING: base Block6 dimensions do not match hybrid mesh."
+            PRINT *, "         Skipping j-spacing redistribution."
+            RETURN
+        END IF
+
+        ALLOCATE(frac(nj))
+        ALLOCATE(shyb(nj))
+        ALLOCATE(xline(nj))
+        ALLOCATE(yline(nj))
+        ALLOCATE(zline(nj))
+
+        DO k = 1, nk
+            DO i = 1, ni
+
+                ! Original Block6 cumulative j spacing fractions.
+                frac(1) = 0.0D0
+                total_base = 0.0D0
+
+                DO j = 2, nj
+                    total_base = total_base + SQRT( &
+                        (xbase(i,j,k)-xbase(i,j-1,k))**2 + &
+                        (ybase(i,j,k)-ybase(i,j-1,k))**2 + &
+                        (zbase(i,j,k)-zbase(i,j-1,k))**2 )
+                    frac(j) = total_base
+                END DO
+
+                IF (total_base <= 1.0D-14) CYCLE
+
+                DO j = 1, nj
+                    frac(j) = frac(j)/total_base
+                END DO
+
+                ! Current hybrid-line cumulative arclength.
+                xline = xhyb(i,:,k)
+                yline = yhyb(i,:,k)
+                zline = zhyb(i,:,k)
+
+                shyb(1) = 0.0D0
+                total_hyb = 0.0D0
+
+                DO j = 2, nj
+                    total_hyb = total_hyb + SQRT( &
+                        (xline(j)-xline(j-1))**2 + &
+                        (yline(j)-yline(j-1))**2 + &
+                        (zline(j)-zline(j-1))**2 )
+                    shyb(j) = total_hyb
+                END DO
+
+                IF (total_hyb <= 1.0D-14) CYCLE
+
+                DO j = 2, nj-1
+
+                    target_s = frac(j)*total_hyb
+
+                    jj = 1
+                    DO WHILE (jj < nj-1 .AND. shyb(jj+1) < target_s)
+                        jj = jj + 1
+                    END DO
+
+                    seg = shyb(jj+1) - shyb(jj)
+
+                    IF (seg <= 1.0D-14) THEN
+                        a = 0.0D0
+                    ELSE
+                        a = (target_s - shyb(jj))/seg
+                    END IF
+
+                    a = MAX(0.0D0, MIN(1.0D0, a))
+
+                    xhyb(i,j,k) = (1.0D0-a)*xline(jj) + a*xline(jj+1)
+                    yhyb(i,j,k) = (1.0D0-a)*yline(jj) + a*yline(jj+1)
+                    zhyb(i,j,k) = (1.0D0-a)*zline(jj) + a*zline(jj+1)
+
+                END DO
+
+                ! Explicitly keep endpoints fixed.
+                xhyb(i,1,k)  = xline(1)
+                yhyb(i,1,k)  = yline(1)
+                zhyb(i,1,k)  = zline(1)
+
+                xhyb(i,nj,k) = xline(nj)
+                yhyb(i,nj,k) = yline(nj)
+                zhyb(i,nj,k) = zline(nj)
+
+            END DO
+        END DO
+
+        DEALLOCATE(frac)
+        DEALLOCATE(shyb)
+        DEALLOCATE(xline)
+        DEALLOCATE(yline)
+        DEALLOCATE(zline)
+
+    END SUBROUTINE redistribute_hybrid_j_lines_to_base_block6_spacing
+
+
+    SUBROUTINE straighten_hybrid_block6_middle_radial_lines( &
+        xbase, ybase, zbase, xhyb, yhyb, zhyb &
+    )
+
+        ! Straighten the main j-lines between the rough wall and outer boundary.
+        ! The protected side i-lines are left unchanged.
+
+        IMPLICIT NONE
+
+        REAL(8), INTENT(IN)    :: xbase(:,:,:)
+        REAL(8), INTENT(IN)    :: ybase(:,:,:)
+        REAL(8), INTENT(IN)    :: zbase(:,:,:)
+        REAL(8), INTENT(INOUT) :: xhyb(:,:,:)
+        REAL(8), INTENT(INOUT) :: yhyb(:,:,:)
+        REAL(8), INTENT(INOUT) :: zhyb(:,:,:)
+
+        INTEGER :: ni
+        INTEGER :: nj
+        INTEGER :: nk
+        INTEGER :: i
+        INTEGER :: j
+        INTEGER :: k
+        INTEGER :: i_start
+        INTEGER :: i_end
+
+        REAL(8) :: xwall
+        REAL(8) :: ywall
+        REAL(8) :: zwall
+        REAL(8) :: xouter
+        REAL(8) :: youter
+        REAL(8) :: zouter
+
+        REAL(8) :: dx
+        REAL(8) :: dy
+        REAL(8) :: dz
+        REAL(8) :: eta
+        REAL(8) :: relax
+
+        REAL(8) :: total_base
+        REAL(8) :: total_current
+        REAL(8) :: seg
+
+        REAL(8), ALLOCATABLE :: frac(:)
+
+        ni = SIZE(xhyb,1)
+        nj = SIZE(xhyb,2)
+        nk = SIZE(xhyb,3)
+
+        IF (ni < 4 .OR. nj < 4 .OR. nk < 1) RETURN
+
+        i_start = 1 + hybrid_block6_straighten_protect_i_lines
+        i_end   = ni - hybrid_block6_straighten_protect_i_lines
+
+        IF (i_start >= i_end) THEN
+            PRINT *, "WARNING: hybrid Block 6 straightening skipped; protected i-region too large."
+            RETURN
+        END IF
+
+        relax = MAX(0.0D0, MIN(1.0D0, hybrid_block6_straighten_relax))
+
+        ALLOCATE(frac(nj))
+
+        DO k = 1, nk
+            DO i = i_start, i_end
+
+                ! Compute spacing fractions.
+                IF (hybrid_block6_straighten_use_base_j_spacing .AND. &
+                    SIZE(xbase,1) == ni .AND. SIZE(xbase,2) == nj .AND. SIZE(xbase,3) == nk) THEN
+
+                    frac(1) = 0.0D0
+                    total_base = 0.0D0
+
+                    DO j = 2, nj
+                        seg = SQRT( &
+                            (xbase(i,j,k)-xbase(i,j-1,k))**2 + &
+                            (ybase(i,j,k)-ybase(i,j-1,k))**2 + &
+                            (zbase(i,j,k)-zbase(i,j-1,k))**2 )
+                        total_base = total_base + seg
+                        frac(j) = total_base
+                    END DO
+
+                    IF (total_base <= 1.0D-14) CYCLE
+
+                    DO j = 1, nj
+                        frac(j) = frac(j)/total_base
+                    END DO
+
+                ELSE
+
+                    ! Fallback: preserve current hybrid line arclength fractions.
+                    frac(1) = 0.0D0
+                    total_current = 0.0D0
+
+                    DO j = 2, nj
+                        seg = SQRT( &
+                            (xhyb(i,j,k)-xhyb(i,j-1,k))**2 + &
+                            (yhyb(i,j,k)-yhyb(i,j-1,k))**2 + &
+                            (zhyb(i,j,k)-zhyb(i,j-1,k))**2 )
+                        total_current = total_current + seg
+                        frac(j) = total_current
+                    END DO
+
+                    IF (total_current <= 1.0D-14) CYCLE
+
+                    DO j = 1, nj
+                        frac(j) = frac(j)/total_current
+                    END DO
+
+                END IF
+
+                xwall = xhyb(i,1,k)
+                ywall = yhyb(i,1,k)
+                zwall = zhyb(i,1,k)
+
+                xouter = xhyb(i,nj,k)
+                youter = yhyb(i,nj,k)
+                zouter = zhyb(i,nj,k)
+
+                dx = xouter - xwall
+                dy = youter - ywall
+                dz = zouter - zwall
+
+                ! Endpoints remain fixed.
+                xhyb(i,1,k)  = xwall
+                yhyb(i,1,k)  = ywall
+                zhyb(i,1,k)  = zwall
+
+                xhyb(i,nj,k) = xouter
+                yhyb(i,nj,k) = youter
+                zhyb(i,nj,k) = zouter
+
+                DO j = 2, nj-1
+
+                    eta = MAX(0.0D0, MIN(1.0D0, frac(j)))
+
+                    xhyb(i,j,k) = (1.0D0-relax)*xhyb(i,j,k) + relax*(xwall + eta*dx)
+                    yhyb(i,j,k) = (1.0D0-relax)*yhyb(i,j,k) + relax*(ywall + eta*dy)
+                    zhyb(i,j,k) = (1.0D0-relax)*zhyb(i,j,k) + relax*(zwall + eta*dz)
+
+                END DO
+
+            END DO
+        END DO
+
+        DEALLOCATE(frac)
+
+        PRINT *, "Hybrid Block 6 straight radial line control:"
+        PRINT *, "  protected side i-lines = ", hybrid_block6_straighten_protect_i_lines
+        PRINT *, "  relax = ", relax
+        PRINT *, "  use base j-spacing = ", hybrid_block6_straighten_use_base_j_spacing
+
+    END SUBROUTINE straighten_hybrid_block6_middle_radial_lines
+
+
+
+
+    SUBROUTINE calculate_procedural_layer_counts(x, y, z, nhex_out, npyr_out)
+
+        IMPLICIT NONE
+
+        REAL(8), INTENT(IN) :: x(:,:,:)
+        REAL(8), INTENT(IN) :: y(:,:,:)
+        REAL(8), INTENT(IN) :: z(:,:,:)
+        INTEGER, INTENT(OUT) :: nhex_out
+        INTEGER, INTENT(OUT) :: npyr_out
+
+        INTEGER :: ni, nj, nk
+        INTEGER :: nc_j
+        INTEGER :: i, k
+        INTEGER :: n_non_tet_layers
+        INTEGER :: n_tet_layers
+        INTEGER :: max_non_tet_layers
+
+        REAL(8) :: max_deviation
+        REAL(8) :: representative_height
+        REAL(8) :: representative_j_spacing
+        REAL(8) :: requested_tet_thickness
+
+        REAL(8), ALLOCATABLE :: mean_x(:)
+        REAL(8), ALLOCATABLE :: mean_y(:)
+        REAL(8), ALLOCATABLE :: mean_z(:)
+
+        ni = SIZE(x,1)
+        nj = SIZE(x,2)
+        nk = SIZE(x,3)
+        nc_j = nj - 1
+
+        ALLOCATE(mean_x(ni))
+        ALLOCATE(mean_y(ni))
+        ALLOCATE(mean_z(ni))
+
+        ! Build the mean blade line from the modified blade-side surface j=1.
+        ! Because Block 6 is extruded, the first average is over k. Then the
+        ! line is smoothed along i to remove the high-frequency roughness and
+        ! give the underlying mean blade line.
+        DO i = 1, ni
+            mean_x(i) = 0.0D0
+            mean_y(i) = 0.0D0
+            mean_z(i) = 0.0D0
+            DO k = 1, nk
+                mean_x(i) = mean_x(i) + x(i,1,k)
+                mean_y(i) = mean_y(i) + y(i,1,k)
+                mean_z(i) = mean_z(i) + z(i,1,k)
+            END DO
+            mean_x(i) = mean_x(i)/REAL(nk,8)
+            mean_y(i) = mean_y(i)/REAL(nk,8)
+            mean_z(i) = mean_z(i)/REAL(nk,8)
+        END DO
+
+        CALL smooth_mean_blade_line(mean_x, mean_y, mean_z, ni, mean_line_smooth_passes)
+
+        max_deviation = 0.0D0
+        DO k = 1, nk
+            DO i = 1, ni
+                max_deviation = MAX(max_deviation, SQRT( &
+                    (x(i,1,k)-mean_x(i))**2 + &
+                    (y(i,1,k)-mean_y(i))**2 + &
+                    (z(i,1,k)-mean_z(i))**2 ))
+            END DO
+        END DO
+
+        ! Representative blade-to-outer height. This converts physical roughness
+        ! thickness into a logical j-layer count.
+        representative_height = 0.0D0
+        DO k = 1, nk
+            DO i = 1, ni
+                representative_height = representative_height + SQRT( &
+                    (x(i,nj,k)-x(i,1,k))**2 + &
+                    (y(i,nj,k)-y(i,1,k))**2 + &
+                    (z(i,nj,k)-z(i,1,k))**2 )
+            END DO
+        END DO
+        representative_height = representative_height/REAL(ni*nk,8)
+
+        IF (representative_height <= 1.0D-14) THEN
+            PRINT *, "ERROR: representative Block 6 height is too small."
+            STOP 1
+        END IF
+
+        representative_j_spacing = representative_height/REAL(nc_j,8)
+        requested_tet_thickness = tet_roughness_safety_factor*max_deviation
+
+        n_tet_layers = CEILING(requested_tet_thickness/representative_j_spacing)
+        n_tet_layers = MAX(min_tet_cells_normal, n_tet_layers)
+
+        max_non_tet_layers = nc_j - n_tet_layers
+        max_non_tet_layers = MAX(min_hex_layers + min_pyramid_layers, max_non_tet_layers)
+
+        n_non_tet_layers = max_non_tet_layers
+
+        nhex_out = NINT(hex_non_tet_fraction*REAL(n_non_tet_layers,8))
+        npyr_out = n_non_tet_layers - nhex_out
+
+        nhex_out = MAX(min_hex_layers, MIN(max_hex_layers, nhex_out))
+        npyr_out = MAX(min_pyramid_layers, MIN(max_pyramid_layers, npyr_out))
+
+        ! Ensure the remaining j-normal core still contains at least the
+        ! requested procedural tetrahedral thickness.
+        DO WHILE (nhex_out + npyr_out + n_tet_layers > nc_j)
+            IF (npyr_out > min_pyramid_layers) THEN
+                npyr_out = npyr_out - 1
+            ELSE IF (nhex_out > min_hex_layers) THEN
+                nhex_out = nhex_out - 1
+            ELSE
+                EXIT
+            END IF
+        END DO
+
+        PRINT *, "Procedural hybrid thickness calculation:"
+        PRINT *, "  max deviation from smoothed mean blade line = ", max_deviation
+        PRINT *, "  representative blade-to-outer height = ", representative_height
+        PRINT *, "  representative j spacing = ", representative_j_spacing
+        PRINT *, "  requested tet-core physical thickness = ", requested_tet_thickness
+        PRINT *, "  procedural tet normal layers = ", n_tet_layers
+        PRINT *, "  procedural hex layers = ", nhex_out
+        PRINT *, "  procedural pyramid layers = ", npyr_out
+
+        DEALLOCATE(mean_x)
+        DEALLOCATE(mean_y)
+        DEALLOCATE(mean_z)
+
+    END SUBROUTINE calculate_procedural_layer_counts
+
+
+    SUBROUTINE smooth_mean_blade_line(xline, yline, zline, n, npass)
+
+        IMPLICIT NONE
+
+        INTEGER, INTENT(IN) :: n
+        INTEGER, INTENT(IN) :: npass
+        REAL(8), INTENT(INOUT) :: xline(n)
+        REAL(8), INTENT(INOUT) :: yline(n)
+        REAL(8), INTENT(INOUT) :: zline(n)
+
+        INTEGER :: pass
+        INTEGER :: i
+        REAL(8), ALLOCATABLE :: xt(:)
+        REAL(8), ALLOCATABLE :: yt(:)
+        REAL(8), ALLOCATABLE :: zt(:)
+
+        ALLOCATE(xt(n))
+        ALLOCATE(yt(n))
+        ALLOCATE(zt(n))
+
+        DO pass = 1, npass
+            xt = xline
+            yt = yline
+            zt = zline
+
+            DO i = 2, n-1
+                xline(i) = 0.25D0*xt(i-1) + 0.50D0*xt(i) + 0.25D0*xt(i+1)
+                yline(i) = 0.25D0*yt(i-1) + 0.50D0*yt(i) + 0.25D0*yt(i+1)
+                zline(i) = 0.25D0*zt(i-1) + 0.50D0*zt(i) + 0.25D0*zt(i+1)
+            END DO
+
+            xline(1) = xt(1)
+            yline(1) = yt(1)
+            zline(1) = zt(1)
+
+            xline(n) = xt(n)
+            yline(n) = yt(n)
+            zline(n) = zt(n)
+        END DO
+
+        DEALLOCATE(xt)
+        DEALLOCATE(yt)
+        DEALLOCATE(zt)
+
+    END SUBROUTINE smooth_mean_blade_line
+
+
+    SUBROUTINE find_base_and_zone(file_id, wanted_base, wanted_zone, base_id, zone_id)
+
+        USE cgns
+        IMPLICIT NONE
+
+        INTEGER, INTENT(IN) :: file_id
+        CHARACTER(LEN=*), INTENT(IN) :: wanted_base
+        CHARACTER(LEN=*), INTENT(IN) :: wanted_zone
+        INTEGER, INTENT(OUT) :: base_id
+        INTEGER, INTENT(OUT) :: zone_id
+
+        INTEGER :: ierr
+        INTEGER :: nbases
+        INTEGER :: nzones
+        INTEGER :: b, z
+        INTEGER :: cell_dim
+        INTEGER :: phys_dim
+
+        CHARACTER(LEN=128) :: base_name
+        CHARACTER(LEN=128) :: zone_name
+
+        INTEGER(KIND=cgsize_t) :: tmp_isize(3,3)
+
+        base_id = -1
+        zone_id = -1
+
+        CALL cg_nbases_f(file_id, nbases, ierr)
+        CALL check_cgns_error(ierr, "cg_nbases_f")
+
+        DO b = 1, nbases
+
+            CALL cg_base_read_f(file_id, b, base_name, cell_dim, phys_dim, ierr)
+            CALL check_cgns_error(ierr, "cg_base_read_f during search")
+
+            IF (TRIM(base_name) /= TRIM(wanted_base)) CYCLE
+
+            CALL cg_nzones_f(file_id, b, nzones, ierr)
+            CALL check_cgns_error(ierr, "cg_nzones_f during search")
+
+            DO z = 1, nzones
+
+                CALL cg_zone_read_f(file_id, b, z, zone_name, tmp_isize, ierr)
+                CALL check_cgns_error(ierr, "cg_zone_read_f during search")
+
+                IF (TRIM(zone_name) == TRIM(wanted_zone)) THEN
+                    base_id = b
+                    zone_id = z
+                    RETURN
+                END IF
+
+            END DO
+
+        END DO
+
+        PRINT *, "ERROR: Could not find requested base/zone."
+        PRINT *, "Wanted base = ", TRIM(wanted_base)
+        PRINT *, "Wanted zone = ", TRIM(wanted_zone)
+        STOP 1
+
+    END SUBROUTINE find_base_and_zone
+
+
+    SUBROUTINE apply_stl_roughness_to_blade_surface_inplace(x, y, z)
+
+        ! Apply the measured STL roughness to the Block 6 blade-side surface j=1.
+        !
+        ! Correct STL interpretation, based on the filtered STL inspection:
+        !   STL x = first in-plane roughness coordinate
+        !   STL z = second in-plane roughness coordinate
+        !   STL y = signed roughness height
+        !
+        ! Mapping onto Block 6:
+        !   local_u = arclength fraction over the selected blade patch
+        !   local_v = spanwise fraction k/(nk-1)
+        !   STL x  -> local_u
+        !   STL z  -> local_v
+        !   STL y  -> displacement along the local blade normal
+        !
+        ! No triangle bins are used here. The STL is reconstructed as a
+        ! structured x-z height grid and sampled with bilinear interpolation.
+
+        IMPLICIT NONE
+
+        REAL(8), INTENT(INOUT) :: x(:,:,:)
+        REAL(8), INTENT(INOUT) :: y(:,:,:)
+        REAL(8), INTENT(INOUT) :: z(:,:,:)
+
+        INTEGER :: ni
+        INTEGER :: nk
+        INTEGER :: i
+        INTEGER :: k
+        INTEGER :: ilo
+        INTEGER :: ihi
+        INTEGER :: stl_nx
+        INTEGER :: stl_nz
+
+        REAL(8), ALLOCATABLE :: s(:)
+        REAL(8), ALLOCATABLE :: nxn(:)
+        REAL(8), ALLOCATABLE :: nyn(:)
+        REAL(8), ALLOCATABLE :: rough_raw(:,:)
+        REAL(8), ALLOCATABLE :: rough_smooth(:,:)
+        REAL(8), ALLOCATABLE :: stl_h(:,:)
+
+        REAL(8) :: total_s
+        REAL(8) :: s0
+        REAL(8) :: s1
+        REAL(8) :: local_u
+        REAL(8) :: local_v
+        REAL(8) :: query_u
+        REAL(8) :: query_v
+        REAL(8) :: window
+        REAL(8) :: rough_height
+        REAL(8) :: stl_umin
+        REAL(8) :: stl_umax
+        REAL(8) :: stl_vmin
+        REAL(8) :: stl_vmax
+        REAL(8) :: pi
+
+        ni = SIZE(x,1)
+        nk = SIZE(x,3)
+
+        ALLOCATE(s(ni))
+        ALLOCATE(nxn(ni))
+        ALLOCATE(nyn(ni))
+        ALLOCATE(rough_raw(ni,nk))
+        ALLOCATE(rough_smooth(ni,nk))
+
+        IF (ALLOCATED(original_blade_nx)) DEALLOCATE(original_blade_nx)
+        IF (ALLOCATED(original_blade_ny)) DEALLOCATE(original_blade_ny)
+        ALLOCATE(original_blade_nx(ni,nk))
+        ALLOCATE(original_blade_ny(ni,nk))
+        original_blade_nx = 0.0D0
+        original_blade_ny = 0.0D0
+        original_blade_normals_available = .FALSE.
+
+        rough_raw = 0.0D0
+        rough_smooth = 0.0D0
+
+        CALL read_structured_yheight_roughness_grid( &
+            roughness_stl_file, &
+            stl_nx, stl_nz, &
+            stl_umin, stl_umax, stl_vmin, stl_vmax, &
+            stl_h &
+        )
+
+        pi = 4.0D0*ATAN(1.0D0)
+
+        CALL compute_surface_arclength(x(:,1,(nk+1)/2), y(:,1,(nk+1)/2), s)
+
+        total_s = s(ni)
+
+        IF (total_s <= 1.0D-14) THEN
+            PRINT *, "ERROR: Block 6 blade-side arclength is too small."
+            STOP 1
+        END IF
+
+        s0 = rough_start_fraction*total_s
+        s1 = rough_end_fraction*total_s
+
+        IF (s1 <= s0) THEN
+            PRINT *, "ERROR: rough_end_fraction must be greater than rough_start_fraction."
+            STOP 1
+        END IF
+
+        ilo = ni
+        ihi = 1
+
+        DO i = 1, ni
+            IF (s(i) >= s0 .AND. s(i) <= s1) THEN
+                ilo = MIN(ilo, i)
+                ihi = MAX(ihi, i)
+            END IF
+        END DO
+
+        PRINT *, "Applying structured Y-height STL roughness to Block 6 blade-side surface j=1."
+        PRINT *, "STL file = ", TRIM(roughness_stl_file)
+        PRINT *, "STL interpretation: u=x, v=z, height=y"
+        PRINT *, "STL structured grid nx,nz = ", stl_nx, stl_nz
+        PRINT *, "STL u=x bounds = ", stl_umin, stl_umax
+        PRINT *, "STL v=z bounds = ", stl_vmin, stl_vmax
+        PRINT *, "STL y-height min/max = ", MINVAL(stl_h), MAXVAL(stl_h)
+        PRINT *, "Roughness arclength fractions = ", rough_start_fraction, rough_end_fraction
+        PRINT *, "Roughness i-index range = ", ilo, ihi
+        PRINT *, "STL height scale/sign = ", stl_height_scale, stl_height_sign
+        PRINT *, "Gaussian roughness filter enabled = ", use_gaussian_roughness_filter
+        PRINT *, "Gaussian sigma i,k nodes = ", gaussian_sigma_i_nodes, gaussian_sigma_k_nodes
+
+        ! First pass: sample measured signed roughness onto Block 6 j=1 nodes.
+        DO k = 1, nk
+
+            CALL compute_surface_arclength(x(:,1,k), y(:,1,k), s)
+
+            total_s = s(ni)
+            s0 = rough_start_fraction*total_s
+            s1 = rough_end_fraction*total_s
+
+            IF (nk > 1) THEN
+                local_v = REAL(k-1,8)/REAL(nk-1,8)
+            ELSE
+                local_v = 0.0D0
+            END IF
+
+            DO i = 1, ni
+
+                IF (s(i) < s0 .OR. s(i) > s1) CYCLE
+
+                local_u = (s(i)-s0)/(s1-s0)
+
+                IF (use_roughness_edge_window) THEN
+                    window = 0.5D0*(1.0D0 - COS(2.0D0*pi*local_u))
+                ELSE
+                    window = 1.0D0
+                END IF
+
+                IF (swap_stl_u_v) THEN
+                    query_u = local_v
+                    query_v = local_u
+                ELSE
+                    query_u = local_u
+                    query_v = local_v
+                END IF
+
+                rough_height = bilinear_structured_roughness_height( &
+                    query_u, query_v, stl_h, stl_nx, stl_nz &
+                )
+
+                rough_raw(i,k) = window*stl_height_sign*stl_height_scale*rough_height
+
+            END DO
+
+        END DO
+
+        PRINT *, "Raw mapped roughness min/max before Gaussian = ", &
+            MINVAL(rough_raw), MAXVAL(rough_raw)
+
+        IF (use_gaussian_roughness_filter) THEN
+            CALL gaussian_smooth_roughness_surface( &
+                rough_raw, rough_smooth, ni, nk, &
+                gaussian_sigma_i_nodes, gaussian_sigma_k_nodes, &
+                gaussian_radius_factor &
+            )
+        ELSE
+            rough_smooth = rough_raw
+        END IF
+
+        PRINT *, "Smoothed mapped roughness min/max = ", &
+            MINVAL(rough_smooth), MAXVAL(rough_smooth)
+
+        ! Second pass: compute ORIGINAL smooth blade normals, store them,
+        ! then displace the blade-side surface along those normals.
+        !
+        ! These stored original normals are later used to make the near-wall
+        ! tetra/pyramid grid lines normal to the original blade surface,
+        ! not normal to the roughened surface.
+        DO k = 1, nk
+
+            CALL compute_curve_normals(x(:,1,k), y(:,1,k), nxn, nyn)
+
+            DO i = 1, ni
+                original_blade_nx(i,k) = nxn(i)
+                original_blade_ny(i,k) = nyn(i)
+
+                x(i,1,k) = x(i,1,k) + rough_smooth(i,k)*nxn(i)
+                y(i,1,k) = y(i,1,k) + rough_smooth(i,k)*nyn(i)
+            END DO
+
+        END DO
+
+        original_blade_normals_available = .TRUE.
+
+        DEALLOCATE(s)
+        DEALLOCATE(nxn)
+        DEALLOCATE(nyn)
+        DEALLOCATE(rough_raw)
+        DEALLOCATE(rough_smooth)
+        DEALLOCATE(stl_h)
+
+    END SUBROUTINE apply_stl_roughness_to_blade_surface_inplace
+
+
+    SUBROUTINE read_structured_yheight_roughness_grid(filename, nx, nz, &
+        umin, umax, vmin, vmax, hgrid)
+
+        ! Read ASCII or binary STL and reconstruct the structured roughness grid.
+        ! Correct interpretation:
+        !   u = STL x
+        !   v = STL z
+        !   h = STL y
+
+        IMPLICIT NONE
+
+        CHARACTER(LEN=*), INTENT(IN) :: filename
+        INTEGER, INTENT(OUT) :: nx
+        INTEGER, INTENT(OUT) :: nz
+        REAL(8), INTENT(OUT) :: umin
+        REAL(8), INTENT(OUT) :: umax
+        REAL(8), INTENT(OUT) :: vmin
+        REAL(8), INTENT(OUT) :: vmax
+        REAL(8), ALLOCATABLE, INTENT(OUT) :: hgrid(:,:)
+
+        INTEGER :: nverts
+        INTEGER :: i
+        INTEGER :: ix
+        INTEGER :: iz
+        INTEGER :: pass
+        INTEGER :: filled_this_pass
+        INTEGER :: empty_initial
+        INTEGER :: empty_after_fill
+        INTEGER :: max_fill_passes
+
+        REAL(8), ALLOCATABLE :: xs(:)
+        REAL(8), ALLOCATABLE :: ys(:)
+        REAL(8), ALLOCATABLE :: zs(:)
+        REAL(8), ALLOCATABLE :: hsum(:,:)
+        REAL(8), ALLOCATABLE :: hnew(:,:)
+        INTEGER, ALLOCATABLE :: hcount(:,:)
+        LOGICAL, ALLOCATABLE :: known(:,:)
+        LOGICAL, ALLOCATABLE :: known_new(:,:)
+
+        REAL(8) :: ymin
+        REAL(8) :: ymax
+        REAL(8) :: dx_guess
+        REAL(8) :: dz_guess
+        REAL(8) :: dx
+        REAL(8) :: dz
+        REAL(8) :: aplane
+        REAL(8) :: bplane
+        REAL(8) :: cplane
+
+        CALL count_structured_yheight_stl_vertices(filename, nverts)
+
+        IF (nverts <= 0) THEN
+            PRINT *, "ERROR: no STL vertices found in ", TRIM(filename)
+            STOP 1
+        END IF
+
+        ALLOCATE(xs(nverts), ys(nverts), zs(nverts))
+        CALL read_structured_yheight_stl_vertices(filename, nverts, xs, ys, zs)
+
+        umin = MINVAL(xs)
+        umax = MAXVAL(xs)
+        ymin = MINVAL(ys)
+        ymax = MAXVAL(ys)
+        vmin = MINVAL(zs)
+        vmax = MAXVAL(zs)
+
+        CALL infer_structured_xz_spacing(nverts, xs, zs, dx_guess, dz_guess)
+
+        IF (dx_guess <= 0.0D0 .OR. dz_guess <= 0.0D0) THEN
+            PRINT *, "ERROR: could not infer structured STL dx/dz."
+            STOP 1
+        END IF
+
+        nx = NINT((umax-umin)/dx_guess) + 1
+        nz = NINT((vmax-vmin)/dz_guess) + 1
+
+        IF (nx <= 1 .OR. nz <= 1) THEN
+            PRINT *, "ERROR: invalid structured STL grid size."
+            PRINT *, "nx,nz = ", nx, nz
+            STOP 1
+        END IF
+
+        dx = (umax-umin)/REAL(nx-1,8)
+        dz = (vmax-vmin)/REAL(nz-1,8)
+
+        ALLOCATE(hgrid(nx,nz))
+        ALLOCATE(hsum(nx,nz))
+        ALLOCATE(hnew(nx,nz))
+        ALLOCATE(hcount(nx,nz))
+        ALLOCATE(known(nx,nz))
+        ALLOCATE(known_new(nx,nz))
+
+        hgrid = 0.0D0
+        hsum = 0.0D0
+        hnew = 0.0D0
+        hcount = 0
+        known = .FALSE.
+        known_new = .FALSE.
+
+        DO i = 1, nverts
+            ix = NINT((xs(i)-umin)/dx) + 1
+            iz = NINT((zs(i)-vmin)/dz) + 1
+
+            ix = MAX(1, MIN(nx, ix))
+            iz = MAX(1, MIN(nz, iz))
+
+            hsum(ix,iz) = hsum(ix,iz) + ys(i)
+            hcount(ix,iz) = hcount(ix,iz) + 1
+        END DO
+
+        empty_initial = 0
+
+        DO iz = 1, nz
+            DO ix = 1, nx
+                IF (hcount(ix,iz) > 0) THEN
+                    hgrid(ix,iz) = hsum(ix,iz)/REAL(hcount(ix,iz),8)
+                    known(ix,iz) = .TRUE.
+                ELSE
+                    hgrid(ix,iz) = 0.0D0
+                    known(ix,iz) = .FALSE.
+                    empty_initial = empty_initial + 1
+                END IF
+            END DO
+        END DO
+
+        IF (subtract_best_fit_plane) THEN
+            CALL subtract_structured_yheight_plane_inplace(nx, nz, hgrid, &
+                aplane, bplane, cplane)
+        ELSE
+            aplane = 0.0D0
+            bplane = 0.0D0
+            cplane = 0.0D0
+        END IF
+
+        max_fill_passes = nx + nz
+
+        DO pass = 1, max_fill_passes
+            hnew = hgrid
+            known_new = known
+            filled_this_pass = 0
+
+            DO iz = 1, nz
+                DO ix = 1, nx
+                    IF (known(ix,iz)) CYCLE
+
+                    CALL fill_structured_yheight_from_neighbours(ix, iz, hgrid, &
+                        known, hnew(ix,iz), known_new(ix,iz))
+
+                    IF (known_new(ix,iz)) filled_this_pass = filled_this_pass + 1
+                END DO
+            END DO
+
+            hgrid = hnew
+            known = known_new
+
+            IF (filled_this_pass == 0) EXIT
+        END DO
+
+        empty_after_fill = 0
+
+        DO iz = 1, nz
+            DO ix = 1, nx
+                IF (.NOT. known(ix,iz)) empty_after_fill = empty_after_fill + 1
+            END DO
+        END DO
+
+        PRINT *, "Structured Y-height roughness STL read."
+        PRINT *, "  STL vertices = ", nverts
+        PRINT *, "  STL x range = ", umin, umax
+        PRINT *, "  STL y height range = ", ymin, ymax
+        PRINT *, "  STL z range = ", vmin, vmax
+        PRINT *, "  reconstructed nx,nz = ", nx, nz
+        PRINT *, "  initial empty nodes = ", empty_initial
+        PRINT *, "  empty nodes after fill = ", empty_after_fill
+        PRINT *, "  subtract_best_fit_plane = ", subtract_best_fit_plane
+        PRINT *, "  fitted plane a,b,c = ", aplane, bplane, cplane
+        PRINT *, "  hgrid min/max = ", MINVAL(hgrid), MAXVAL(hgrid)
+
+        DEALLOCATE(xs, ys, zs)
+        DEALLOCATE(hsum, hnew, hcount, known, known_new)
+
+    END SUBROUTINE read_structured_yheight_roughness_grid
+
+
+    REAL(8) FUNCTION bilinear_structured_roughness_height(local_u, local_v, &
+        hgrid, nx, nz)
+
+        IMPLICIT NONE
+
+        REAL(8), INTENT(IN) :: local_u
+        REAL(8), INTENT(IN) :: local_v
+        REAL(8), INTENT(IN) :: hgrid(nx,nz)
+        INTEGER, INTENT(IN) :: nx
+        INTEGER, INTENT(IN) :: nz
+
+        REAL(8) :: uu
+        REAL(8) :: vv
+        REAL(8) :: gu
+        REAL(8) :: gv
+        REAL(8) :: fu
+        REAL(8) :: fv
+        INTEGER :: i0
+        INTEGER :: k0
+        INTEGER :: i1
+        INTEGER :: k1
+
+        uu = MAX(0.0D0, MIN(1.0D0, local_u))
+        vv = MAX(0.0D0, MIN(1.0D0, local_v))
+
+        gu = 1.0D0 + uu*REAL(nx-1,8)
+        gv = 1.0D0 + vv*REAL(nz-1,8)
+
+        i0 = INT(gu)
+        k0 = INT(gv)
+
+        i0 = MAX(1, MIN(nx-1, i0))
+        k0 = MAX(1, MIN(nz-1, k0))
+
+        i1 = i0 + 1
+        k1 = k0 + 1
+
+        fu = gu - REAL(i0,8)
+        fv = gv - REAL(k0,8)
+
+        bilinear_structured_roughness_height = &
+            (1.0D0-fu)*(1.0D0-fv)*hgrid(i0,k0) + &
+            fu       *(1.0D0-fv)*hgrid(i1,k0) + &
+            fu       *fv       *hgrid(i1,k1) + &
+            (1.0D0-fu)*fv       *hgrid(i0,k1)
+
+    END FUNCTION bilinear_structured_roughness_height
+
+
+    SUBROUTINE count_structured_yheight_stl_vertices(filename, nverts)
+
+        IMPLICIT NONE
+
+        CHARACTER(LEN=*), INTENT(IN) :: filename
+        INTEGER, INTENT(OUT) :: nverts
+
+        INTEGER :: nverts_ascii
+        INTEGER :: ntri_binary
+        LOGICAL :: is_binary
+
+        CALL count_structured_yheight_ascii_vertices(filename, nverts_ascii)
+
+        IF (nverts_ascii > 0) THEN
+            nverts = nverts_ascii
+            PRINT *, "STL reader: ASCII STL detected."
+            RETURN
+        END IF
+
+        CALL count_structured_yheight_binary_triangles(filename, ntri_binary, is_binary)
+
+        IF (is_binary .AND. ntri_binary > 0) THEN
+            nverts = 3*ntri_binary
+            PRINT *, "STL reader: binary STL detected."
+            RETURN
+        END IF
+
+        nverts = 0
+
+    END SUBROUTINE count_structured_yheight_stl_vertices
+
+
+    SUBROUTINE read_structured_yheight_stl_vertices(filename, nverts, xs, ys, zs)
+
+        IMPLICIT NONE
+
+        CHARACTER(LEN=*), INTENT(IN) :: filename
+        INTEGER, INTENT(IN) :: nverts
+        REAL(8), INTENT(OUT) :: xs(nverts)
+        REAL(8), INTENT(OUT) :: ys(nverts)
+        REAL(8), INTENT(OUT) :: zs(nverts)
+
+        INTEGER :: nverts_ascii
+        INTEGER :: ntri_binary
+        LOGICAL :: is_binary
+
+        CALL count_structured_yheight_ascii_vertices(filename, nverts_ascii)
+
+        IF (nverts_ascii > 0) THEN
+            IF (nverts_ascii /= nverts) THEN
+                PRINT *, "ERROR: ASCII STL vertex count mismatch."
+                STOP 1
+            END IF
+
+            CALL read_structured_yheight_ascii_vertices(filename, nverts, xs, ys, zs)
+            RETURN
+        END IF
+
+        CALL count_structured_yheight_binary_triangles(filename, ntri_binary, is_binary)
+
+        IF (is_binary .AND. 3*ntri_binary == nverts) THEN
+            CALL read_structured_yheight_binary_vertices(filename, ntri_binary, xs, ys, zs)
+            RETURN
+        END IF
+
+        PRINT *, "ERROR: STL file is neither recognised ASCII STL nor binary STL."
+        PRINT *, "file = ", TRIM(filename)
+        STOP 1
+
+    END SUBROUTINE read_structured_yheight_stl_vertices
+
+
+    SUBROUTINE count_structured_yheight_ascii_vertices(filename, nverts)
+
+        IMPLICIT NONE
+
+        CHARACTER(LEN=*), INTENT(IN) :: filename
+        INTEGER, INTENT(OUT) :: nverts
+
+        INTEGER :: unit_id
+        INTEGER :: ios
+        CHARACTER(LEN=512) :: line
+        CHARACTER(LEN=32) :: token
+        REAL(8) :: a,b,c
+
+        nverts = 0
+
+        OPEN(NEWUNIT=unit_id, FILE=filename, STATUS="OLD", ACTION="READ", IOSTAT=ios)
+        IF (ios /= 0) THEN
+            PRINT *, "ERROR: could not open STL file: ", TRIM(filename)
+            STOP 1
+        END IF
+
+        DO
+            READ(unit_id,"(A)",IOSTAT=ios) line
+            IF (ios /= 0) EXIT
+
+            token = ""
+            READ(line,*,IOSTAT=ios) token, a, b, c
+
+            IF (ios == 0) THEN
+                CALL lowercase_structured_yheight(token)
+                IF (TRIM(token) == "vertex") nverts = nverts + 1
+            END IF
+        END DO
+
+        CLOSE(unit_id)
+
+    END SUBROUTINE count_structured_yheight_ascii_vertices
+
+
+    SUBROUTINE read_structured_yheight_ascii_vertices(filename, nverts, xs, ys, zs)
+
+        IMPLICIT NONE
+
+        CHARACTER(LEN=*), INTENT(IN) :: filename
+        INTEGER, INTENT(IN) :: nverts
+        REAL(8), INTENT(OUT) :: xs(nverts), ys(nverts), zs(nverts)
+
+        INTEGER :: unit_id
+        INTEGER :: ios
+        INTEGER :: iv
+        CHARACTER(LEN=512) :: line
+        CHARACTER(LEN=32) :: token
+        REAL(8) :: a,b,c
+
+        iv = 0
+
+        OPEN(NEWUNIT=unit_id, FILE=filename, STATUS="OLD", ACTION="READ", IOSTAT=ios)
+        IF (ios /= 0) THEN
+            PRINT *, "ERROR: could not open STL file: ", TRIM(filename)
+            STOP 1
+        END IF
+
+        DO
+            READ(unit_id,"(A)",IOSTAT=ios) line
+            IF (ios /= 0) EXIT
+
+            token = ""
+            READ(line,*,IOSTAT=ios) token, a, b, c
+
+            IF (ios == 0) THEN
+                CALL lowercase_structured_yheight(token)
+
+                IF (TRIM(token) == "vertex") THEN
+                    iv = iv + 1
+                    xs(iv) = a
+                    ys(iv) = b
+                    zs(iv) = c
+                END IF
+            END IF
+        END DO
+
+        CLOSE(unit_id)
+
+        IF (iv /= nverts) THEN
+            PRINT *, "ERROR: ASCII STL vertex read mismatch."
+            STOP 1
+        END IF
+
+    END SUBROUTINE read_structured_yheight_ascii_vertices
+
+
+    SUBROUTINE count_structured_yheight_binary_triangles(filename, ntri, is_binary)
+
+        IMPLICIT NONE
+
+        CHARACTER(LEN=*), INTENT(IN) :: filename
+        INTEGER, INTENT(OUT) :: ntri
+        LOGICAL, INTENT(OUT) :: is_binary
+
+        INTEGER :: unit_id
+        INTEGER :: ios
+        INTEGER :: file_size
+        INTEGER :: ntri_file
+        CHARACTER(LEN=80) :: header
+
+        ntri = 0
+        is_binary = .FALSE.
+
+        INQUIRE(FILE=filename, SIZE=file_size)
+
+        IF (file_size < 84) RETURN
+        IF (MOD(file_size-84,50) /= 0) RETURN
+
+        OPEN(NEWUNIT=unit_id, FILE=filename, STATUS="OLD", ACCESS="STREAM", &
+            FORM="UNFORMATTED", ACTION="READ", IOSTAT=ios)
+        IF (ios /= 0) RETURN
+
+        READ(unit_id, IOSTAT=ios) header
+        IF (ios /= 0) THEN
+            CLOSE(unit_id)
+            RETURN
+        END IF
+
+        READ(unit_id, IOSTAT=ios) ntri_file
+        IF (ios /= 0) THEN
+            CLOSE(unit_id)
+            RETURN
+        END IF
+
+        CLOSE(unit_id)
+
+        IF (ntri_file <= 0) RETURN
+
+        IF (84 + 50*ntri_file == file_size) THEN
+            ntri = ntri_file
+            is_binary = .TRUE.
+        END IF
+
+    END SUBROUTINE count_structured_yheight_binary_triangles
+
+
+    SUBROUTINE read_structured_yheight_binary_vertices(filename, ntri, xs, ys, zs)
+
+        IMPLICIT NONE
+
+        CHARACTER(LEN=*), INTENT(IN) :: filename
+        INTEGER, INTENT(IN) :: ntri
+        REAL(8), INTENT(OUT) :: xs(3*ntri)
+        REAL(8), INTENT(OUT) :: ys(3*ntri)
+        REAL(8), INTENT(OUT) :: zs(3*ntri)
+
+        INTEGER :: unit_id
+        INTEGER :: ios
+        INTEGER :: it
+        INTEGER :: iv
+        INTEGER :: ntri_file
+        INTEGER(2) :: attr
+        CHARACTER(LEN=80) :: header
+        REAL(4) :: nx4, ny4, nz4
+        REAL(4) :: x1,y1,z1,x2,y2,z2,x3,y3,z3
+
+        OPEN(NEWUNIT=unit_id, FILE=filename, STATUS="OLD", ACCESS="STREAM", &
+            FORM="UNFORMATTED", ACTION="READ", IOSTAT=ios)
+        IF (ios /= 0) THEN
+            PRINT *, "ERROR: could not open binary STL file: ", TRIM(filename)
+            STOP 1
+        END IF
+
+        READ(unit_id, IOSTAT=ios) header
+        IF (ios /= 0) STOP "ERROR: could not read binary STL header."
+
+        READ(unit_id, IOSTAT=ios) ntri_file
+        IF (ios /= 0) STOP "ERROR: could not read binary STL triangle count."
+
+        IF (ntri_file /= ntri) THEN
+            PRINT *, "ERROR: binary STL triangle count mismatch."
+            STOP 1
+        END IF
+
+        DO it = 1, ntri
+            READ(unit_id, IOSTAT=ios) nx4, ny4, nz4, &
+                x1, y1, z1, x2, y2, z2, x3, y3, z3, attr
+
+            IF (ios /= 0) THEN
+                PRINT *, "ERROR: failed while reading binary STL triangle ", it
+                STOP 1
+            END IF
+
+            iv = 3*it - 2
+            xs(iv) = REAL(x1,8)
+            ys(iv) = REAL(y1,8)
+            zs(iv) = REAL(z1,8)
+
+            iv = 3*it - 1
+            xs(iv) = REAL(x2,8)
+            ys(iv) = REAL(y2,8)
+            zs(iv) = REAL(z2,8)
+
+            iv = 3*it
+            xs(iv) = REAL(x3,8)
+            ys(iv) = REAL(y3,8)
+            zs(iv) = REAL(z3,8)
+        END DO
+
+        CLOSE(unit_id)
+
+    END SUBROUTINE read_structured_yheight_binary_vertices
+
+
+    SUBROUTINE infer_structured_xz_spacing(nverts, xs, zs, dx, dz)
+
+        IMPLICIT NONE
+
+        INTEGER, INTENT(IN) :: nverts
+        REAL(8), INTENT(IN) :: xs(nverts)
+        REAL(8), INTENT(IN) :: zs(nverts)
+        REAL(8), INTENT(OUT) :: dx
+        REAL(8), INTENT(OUT) :: dz
+
+        INTEGER :: i,j
+        REAL(8) :: ddx, ddz
+        REAL(8) :: tol
+
+        dx = HUGE(1.0D0)
+        dz = HUGE(1.0D0)
+        tol = 1.0D-14
+
+        DO i = 1, MIN(nverts, 3000)
+            DO j = i+1, MIN(nverts, 3000)
+                ddx = ABS(xs(j)-xs(i))
+                ddz = ABS(zs(j)-zs(i))
+
+                IF (ddx > tol) dx = MIN(dx, ddx)
+                IF (ddz > tol) dz = MIN(dz, ddz)
+            END DO
+        END DO
+
+        IF (dx == HUGE(1.0D0)) dx = -1.0D0
+        IF (dz == HUGE(1.0D0)) dz = -1.0D0
+
+    END SUBROUTINE infer_structured_xz_spacing
+
+
+    SUBROUTINE fill_structured_yheight_from_neighbours(ix, iz, hgrid, known, hout, known_out)
+
+        IMPLICIT NONE
+
+        INTEGER, INTENT(IN) :: ix, iz
+        REAL(8), INTENT(IN) :: hgrid(:,:)
+        LOGICAL, INTENT(IN) :: known(:,:)
+        REAL(8), INTENT(OUT) :: hout
+        LOGICAL, INTENT(OUT) :: known_out
+
+        INTEGER :: dxs, dzs, jx, jz, n
+        REAL(8) :: s
+
+        s = 0.0D0
+        n = 0
+
+        DO dzs = -1, 1
+            DO dxs = -1, 1
+                IF (dxs == 0 .AND. dzs == 0) CYCLE
+
+                jx = ix + dxs
+                jz = iz + dzs
+
+                IF (jx < 1 .OR. jx > SIZE(hgrid,1)) CYCLE
+                IF (jz < 1 .OR. jz > SIZE(hgrid,2)) CYCLE
+
+                IF (known(jx,jz)) THEN
+                    s = s + hgrid(jx,jz)
+                    n = n + 1
+                END IF
+            END DO
+        END DO
+
+        IF (n > 0) THEN
+            hout = s/REAL(n,8)
+            known_out = .TRUE.
+        ELSE
+            hout = hgrid(ix,iz)
+            known_out = .FALSE.
+        END IF
+
+    END SUBROUTINE fill_structured_yheight_from_neighbours
+
+
+    SUBROUTINE subtract_structured_yheight_plane_inplace(nx, nz, hgrid, a, b, c)
+
+        IMPLICIT NONE
+
+        INTEGER, INTENT(IN) :: nx, nz
+        REAL(8), INTENT(INOUT) :: hgrid(nx,nz)
+        REAL(8), INTENT(OUT) :: a,b,c
+
+        ! Placeholder: keep existing signed measured roughness unless explicitly
+        ! enabled and later expanded with physical x/z coordinates.
+        a = 0.0D0
+        b = 0.0D0
+        c = 0.0D0
+
+    END SUBROUTINE subtract_structured_yheight_plane_inplace
+
+
+    SUBROUTINE lowercase_structured_yheight(text)
+
+        IMPLICIT NONE
+
+        CHARACTER(LEN=*), INTENT(INOUT) :: text
+        INTEGER :: ii
+        INTEGER :: ich
+
+        DO ii = 1, LEN(text)
+            ich = IACHAR(text(ii:ii))
+            IF (ich >= IACHAR("A") .AND. ich <= IACHAR("Z")) THEN
+                text(ii:ii) = ACHAR(ich + 32)
+            END IF
+        END DO
+
+    END SUBROUTINE lowercase_structured_yheight
+
+
+    SUBROUTINE gaussian_smooth_roughness_surface(raw, smooth, ni, nk, sigma_i, sigma_k, radius_factor)
+
+        IMPLICIT NONE
+
+        INTEGER, INTENT(IN) :: ni
+        INTEGER, INTENT(IN) :: nk
+        REAL(8), INTENT(IN) :: raw(ni,nk)
+        REAL(8), INTENT(OUT) :: smooth(ni,nk)
+        REAL(8), INTENT(IN) :: sigma_i
+        REAL(8), INTENT(IN) :: sigma_k
+        REAL(8), INTENT(IN) :: radius_factor
+
+        INTEGER :: i
+        INTEGER :: k
+        INTEGER :: ii
+        INTEGER :: kk
+        INTEGER :: di
+        INTEGER :: dk
+        INTEGER :: ri
+        INTEGER :: rk
+
+        REAL(8) :: wi
+        REAL(8) :: wk
+        REAL(8) :: w
+        REAL(8) :: wsum
+        REAL(8) :: val
+
+        IF (sigma_i <= 1.0D-12 .AND. sigma_k <= 1.0D-12) THEN
+            smooth = raw
+            RETURN
+        END IF
+
+        ri = MAX(1, CEILING(radius_factor*MAX(sigma_i,1.0D-12)))
+        rk = MAX(0, CEILING(radius_factor*MAX(sigma_k,1.0D-12)))
+
+        IF (nk <= 1) rk = 0
+
+        DO k = 1, nk
+            DO i = 1, ni
+
+                val = 0.0D0
+                wsum = 0.0D0
+
+                DO kk = MAX(1,k-rk), MIN(nk,k+rk)
+                    dk = kk - k
+
+                    IF (sigma_k <= 1.0D-12 .OR. nk <= 1) THEN
+                        wk = 1.0D0
+                    ELSE
+                        wk = EXP(-0.5D0*(REAL(dk,8)/sigma_k)**2)
+                    END IF
+
+                    DO ii = MAX(1,i-ri), MIN(ni,i+ri)
+                        di = ii - i
+
+                        IF (sigma_i <= 1.0D-12) THEN
+                            wi = 1.0D0
+                        ELSE
+                            wi = EXP(-0.5D0*(REAL(di,8)/sigma_i)**2)
+                        END IF
+
+                        w = wi*wk
+                        val = val + w*raw(ii,kk)
+                        wsum = wsum + w
+
+                    END DO
+                END DO
+
+                IF (wsum > 1.0D-14) THEN
+                    smooth(i,k) = val/wsum
+                ELSE
+                    smooth(i,k) = raw(i,k)
+                END IF
+
+            END DO
+        END DO
+
+    END SUBROUTINE gaussian_smooth_roughness_surface
+
+
+    REAL(8) FUNCTION map_unit_to_stl_coordinate(q, qmin, qmax, tile_enabled)
+
+        IMPLICIT NONE
+
+        REAL(8), INTENT(IN) :: q
+        REAL(8), INTENT(IN) :: qmin
+        REAL(8), INTENT(IN) :: qmax
+        LOGICAL, INTENT(IN) :: tile_enabled
+
+        REAL(8) :: qq
+
+        qq = q
+
+        IF (tile_enabled) THEN
+            qq = qq - FLOOR(qq)
+        ELSE
+            qq = MAX(0.0D0, MIN(1.0D0, qq))
+        END IF
+
+        map_unit_to_stl_coordinate = qmin + qq*(qmax-qmin)
+
+    END FUNCTION map_unit_to_stl_coordinate
+
+
+    SUBROUTINE read_stl_height_triangles(filename, ntri, &
+        t1u, t1v, t1h, t2u, t2v, t2h, t3u, t3v, t3h, &
+        umin, umax, vmin, vmax)
+
+        IMPLICIT NONE
+
+        CHARACTER(LEN=*), INTENT(IN) :: filename
+        INTEGER, INTENT(OUT) :: ntri
+        REAL(8), ALLOCATABLE, INTENT(OUT) :: t1u(:), t1v(:), t1h(:)
+        REAL(8), ALLOCATABLE, INTENT(OUT) :: t2u(:), t2v(:), t2h(:)
+        REAL(8), ALLOCATABLE, INTENT(OUT) :: t3u(:), t3v(:), t3h(:)
+        REAL(8), INTENT(OUT) :: umin, umax, vmin, vmax
+
+        INTEGER :: n_ascii_vertices
+        LOGICAL :: ascii_ok
+
+        CALL count_ascii_stl_vertices(filename, n_ascii_vertices)
+
+        ascii_ok = (n_ascii_vertices >= 3 .AND. MOD(n_ascii_vertices,3) == 0)
+
+        IF (ascii_ok) THEN
+            CALL read_ascii_stl_height_triangles(filename, ntri, &
+                t1u, t1v, t1h, t2u, t2v, t2h, t3u, t3v, t3h, &
+                umin, umax, vmin, vmax)
+        ELSE
+            CALL read_binary_stl_height_triangles(filename, ntri, &
+                t1u, t1v, t1h, t2u, t2v, t2h, t3u, t3v, t3h, &
+                umin, umax, vmin, vmax)
+        END IF
+
+        IF (ntri <= 0) THEN
+            PRINT *, "ERROR: no triangles were read from STL file."
+            STOP 1
+        END IF
+
+        ! Optional STL in-plane scaling. This only affects the source map size,
+        ! not the final blade dimensions. The map is still stretched/tiled onto
+        ! the requested blade patch.
+        t1u = stl_u_scale*t1u
+        t2u = stl_u_scale*t2u
+        t3u = stl_u_scale*t3u
+        t1v = stl_v_scale*t1v
+        t2v = stl_v_scale*t2v
+        t3v = stl_v_scale*t3v
+
+        CALL get_stl_uv_bounds(ntri, t1u, t1v, t2u, t2v, t3u, t3v, umin, umax, vmin, vmax)
+
+        IF (umax <= umin .OR. vmax <= vmin) THEN
+            PRINT *, "ERROR: STL projected u/v bounds are degenerate."
+            PRINT *, "umin,umax,vmin,vmax = ", umin, umax, vmin, vmax
+            STOP 1
+        END IF
+
+    END SUBROUTINE read_stl_height_triangles
+
+
+    SUBROUTINE count_ascii_stl_vertices(filename, nverts)
+
+        IMPLICIT NONE
+
+        CHARACTER(LEN=*), INTENT(IN) :: filename
+        INTEGER, INTENT(OUT) :: nverts
+
+        INTEGER :: unit_id
+        INTEGER :: ios
+        CHARACTER(LEN=512) :: line
+        CHARACTER(LEN=32) :: word
+
+        nverts = 0
+        unit_id = 701
+
+        OPEN(unit=unit_id, file=filename, status="old", action="read", form="formatted", iostat=ios)
+        IF (ios /= 0) THEN
+            PRINT *, "ERROR: could not open STL file: ", TRIM(filename)
+            STOP 1
+        END IF
+
+        DO
+            READ(unit_id,'(A)',IOSTAT=ios) line
+            IF (ios /= 0) EXIT
+            word = ""
+            READ(line,*,IOSTAT=ios) word
+            IF (ios == 0) THEN
+                IF (TRIM(word) == "vertex") nverts = nverts + 1
+            END IF
+        END DO
+
+        CLOSE(unit_id)
+
+    END SUBROUTINE count_ascii_stl_vertices
+
+
+    SUBROUTINE read_ascii_stl_height_triangles(filename, ntri, &
+        t1u, t1v, t1h, t2u, t2v, t2h, t3u, t3v, t3h, &
+        umin, umax, vmin, vmax)
+
+        IMPLICIT NONE
+
+        CHARACTER(LEN=*), INTENT(IN) :: filename
+        INTEGER, INTENT(OUT) :: ntri
+        REAL(8), ALLOCATABLE, INTENT(OUT) :: t1u(:), t1v(:), t1h(:)
+        REAL(8), ALLOCATABLE, INTENT(OUT) :: t2u(:), t2v(:), t2h(:)
+        REAL(8), ALLOCATABLE, INTENT(OUT) :: t3u(:), t3v(:), t3h(:)
+        REAL(8), INTENT(OUT) :: umin, umax, vmin, vmax
+
+        INTEGER :: nverts
+        INTEGER :: n
+        INTEGER :: unit_id
+        INTEGER :: ios
+        INTEGER :: iv
+        INTEGER :: it
+        CHARACTER(LEN=512) :: line
+        CHARACTER(LEN=32) :: word
+        REAL(8) :: vx
+        REAL(8) :: vy
+        REAL(8) :: vz
+        REAL(8), ALLOCATABLE :: vu(:), vv(:), vh(:)
+        REAL(8) :: mean_h
+
+        CALL count_ascii_stl_vertices(filename, nverts)
+
+        ntri = nverts/3
+        ALLOCATE(vu(nverts), vv(nverts), vh(nverts))
+
+        unit_id = 702
+        OPEN(unit=unit_id, file=filename, status="old", action="read", form="formatted", iostat=ios)
+        IF (ios /= 0) THEN
+            PRINT *, "ERROR: could not open ASCII STL file: ", TRIM(filename)
+            STOP 1
+        END IF
+
+        iv = 0
+        DO
+            READ(unit_id,'(A)',IOSTAT=ios) line
+            IF (ios /= 0) EXIT
+            word = ""
+            vx = 0.0D0
+            vy = 0.0D0
+            vz = 0.0D0
+            READ(line,*,IOSTAT=ios) word, vx, vy, vz
+            IF (ios == 0) THEN
+                IF (TRIM(word) == "vertex") THEN
+                    iv = iv + 1
+                    vu(iv) = vx
+                    vv(iv) = vy
+                    vh(iv) = vz
+                END IF
+            END IF
+        END DO
+        CLOSE(unit_id)
+
+        IF (iv /= nverts) THEN
+            PRINT *, "ERROR: ASCII STL vertex read mismatch."
+            STOP 1
+        END IF
+
+        mean_h = SUM(vh)/REAL(nverts,8)
+        vh = vh - mean_h
+
+        ALLOCATE(t1u(ntri), t1v(ntri), t1h(ntri))
+        ALLOCATE(t2u(ntri), t2v(ntri), t2h(ntri))
+        ALLOCATE(t3u(ntri), t3v(ntri), t3h(ntri))
+
+        DO it=1,ntri
+            n = 3*(it-1)
+            t1u(it)=vu(n+1); t1v(it)=vv(n+1); t1h(it)=vh(n+1)
+            t2u(it)=vu(n+2); t2v(it)=vv(n+2); t2h(it)=vh(n+2)
+            t3u(it)=vu(n+3); t3v(it)=vv(n+3); t3h(it)=vh(n+3)
+        END DO
+
+        CALL get_stl_uv_bounds(ntri, t1u, t1v, t2u, t2v, t3u, t3v, umin, umax, vmin, vmax)
+
+        PRINT *, "Read ASCII STL roughness. Mean height removed = ", mean_h
+
+        DEALLOCATE(vu,vv,vh)
+
+    END SUBROUTINE read_ascii_stl_height_triangles
+
+
+    SUBROUTINE read_binary_stl_height_triangles(filename, ntri, &
+        t1u, t1v, t1h, t2u, t2v, t2h, t3u, t3v, t3h, &
+        umin, umax, vmin, vmax)
+
+        IMPLICIT NONE
+
+        CHARACTER(LEN=*), INTENT(IN) :: filename
+        INTEGER, INTENT(OUT) :: ntri
+        REAL(8), ALLOCATABLE, INTENT(OUT) :: t1u(:), t1v(:), t1h(:)
+        REAL(8), ALLOCATABLE, INTENT(OUT) :: t2u(:), t2v(:), t2h(:)
+        REAL(8), ALLOCATABLE, INTENT(OUT) :: t3u(:), t3v(:), t3h(:)
+        REAL(8), INTENT(OUT) :: umin, umax, vmin, vmax
+
+        INTEGER :: unit_id
+        INTEGER :: ios
+        INTEGER :: it
+        CHARACTER(LEN=80) :: header
+        INTEGER(4) :: ntri_i4
+        INTEGER(2) :: attr
+        REAL(4) :: nx4,ny4,nz4
+        REAL(4) :: x1,y1,z1,x2,y2,z2,x3,y3,z3
+        REAL(8) :: mean_h
+
+        unit_id = 703
+        OPEN(unit=unit_id, file=filename, status="old", action="read", &
+             access="stream", form="unformatted", iostat=ios)
+        IF (ios /= 0) THEN
+            PRINT *, "ERROR: could not open binary STL file: ", TRIM(filename)
+            STOP 1
+        END IF
+
+        READ(unit_id,IOSTAT=ios) header
+        IF (ios /= 0) THEN
+            PRINT *, "ERROR: could not read binary STL header."
+            STOP 1
+        END IF
+
+        READ(unit_id,IOSTAT=ios) ntri_i4
+        IF (ios /= 0) THEN
+            PRINT *, "ERROR: could not read binary STL triangle count."
+            STOP 1
+        END IF
+
+        ntri = INT(ntri_i4)
+
+        IF (ntri <= 0) THEN
+            PRINT *, "ERROR: binary STL reports non-positive triangle count."
+            STOP 1
+        END IF
+
+        ALLOCATE(t1u(ntri), t1v(ntri), t1h(ntri))
+        ALLOCATE(t2u(ntri), t2v(ntri), t2h(ntri))
+        ALLOCATE(t3u(ntri), t3v(ntri), t3h(ntri))
+
+        mean_h = 0.0D0
+
+        DO it=1,ntri
+            READ(unit_id,IOSTAT=ios) nx4,ny4,nz4,x1,y1,z1,x2,y2,z2,x3,y3,z3,attr
+            IF (ios /= 0) THEN
+                PRINT *, "ERROR: failed while reading binary STL triangle ", it
+                STOP 1
+            END IF
+
+            t1u(it)=REAL(x1,8); t1v(it)=REAL(y1,8); t1h(it)=REAL(z1,8)
+            t2u(it)=REAL(x2,8); t2v(it)=REAL(y2,8); t2h(it)=REAL(z2,8)
+            t3u(it)=REAL(x3,8); t3v(it)=REAL(y3,8); t3h(it)=REAL(z3,8)
+
+            mean_h = mean_h + t1h(it) + t2h(it) + t3h(it)
+        END DO
+
+        CLOSE(unit_id)
+
+        mean_h = mean_h/REAL(3*ntri,8)
+        t1h = t1h - mean_h
+        t2h = t2h - mean_h
+        t3h = t3h - mean_h
+
+        CALL get_stl_uv_bounds(ntri, t1u, t1v, t2u, t2v, t3u, t3v, umin, umax, vmin, vmax)
+
+        PRINT *, "Read binary STL roughness. Mean height removed = ", mean_h
+
+    END SUBROUTINE read_binary_stl_height_triangles
+
+
+    SUBROUTINE get_stl_uv_bounds(ntri, t1u, t1v, t2u, t2v, t3u, t3v, umin, umax, vmin, vmax)
+
+        IMPLICIT NONE
+
+        INTEGER, INTENT(IN) :: ntri
+        REAL(8), INTENT(IN) :: t1u(:), t1v(:), t2u(:), t2v(:), t3u(:), t3v(:)
+        REAL(8), INTENT(OUT) :: umin, umax, vmin, vmax
+
+        umin = MIN(MINVAL(t1u), MIN(MINVAL(t2u), MINVAL(t3u)))
+        umax = MAX(MAXVAL(t1u), MAX(MAXVAL(t2u), MAXVAL(t3u)))
+        vmin = MIN(MINVAL(t1v), MIN(MINVAL(t2v), MINVAL(t3v)))
+        vmax = MAX(MAXVAL(t1v), MAX(MAXVAL(t2v), MAXVAL(t3v)))
+
+    END SUBROUTINE get_stl_uv_bounds
+
+
+
+    SUBROUTINE build_stl_triangle_bins(ntri, t1u, t1v, t2u, t2v, t3u, t3v, &
+        umin, umax, vmin, vmax, bin_counts, bin_tris)
+
+        IMPLICIT NONE
+
+        INTEGER, INTENT(IN) :: ntri
+        REAL(8), INTENT(IN) :: t1u(:), t1v(:), t2u(:), t2v(:), t3u(:), t3v(:)
+        REAL(8), INTENT(IN) :: umin, umax, vmin, vmax
+        INTEGER, INTENT(OUT) :: bin_counts(:,:)
+        INTEGER, INTENT(OUT) :: bin_tris(:,:,:)
+
+        INTEGER :: it
+        INTEGER :: iu, iv
+        INTEGER :: iu0, iu1, iv0, iv1
+        INTEGER :: nu, nv
+        INTEGER :: nadd
+        INTEGER :: noverflow
+
+        REAL(8) :: tu_min, tu_max
+        REAL(8) :: tv_min, tv_max
+
+        nu = SIZE(bin_counts,1)
+        nv = SIZE(bin_counts,2)
+
+        bin_counts = 0
+        bin_tris = 0
+        noverflow = 0
+
+        DO it = 1, ntri
+
+            tu_min = MIN(t1u(it), MIN(t2u(it), t3u(it)))
+            tu_max = MAX(t1u(it), MAX(t2u(it), t3u(it)))
+            tv_min = MIN(t1v(it), MIN(t2v(it), t3v(it)))
+            tv_max = MAX(t1v(it), MAX(t2v(it), t3v(it)))
+
+            iu0 = uv_to_bin_index(tu_min, umin, umax, nu)
+            iu1 = uv_to_bin_index(tu_max, umin, umax, nu)
+            iv0 = uv_to_bin_index(tv_min, vmin, vmax, nv)
+            iv1 = uv_to_bin_index(tv_max, vmin, vmax, nv)
+
+            DO iv = iv0, iv1
+                DO iu = iu0, iu1
+
+                    nadd = bin_counts(iu,iv) + 1
+
+                    IF (nadd <= SIZE(bin_tris,1)) THEN
+                        bin_counts(iu,iv) = nadd
+                        bin_tris(nadd,iu,iv) = it
+                    ELSE
+                        noverflow = noverflow + 1
+                    END IF
+
+                END DO
+            END DO
+
+        END DO
+
+        PRINT *, "Built STL triangle spatial bins."
+        PRINT *, "  bins u,v = ", nu, nv
+        PRINT *, "  max triangles per bin = ", SIZE(bin_tris,1)
+        PRINT *, "  max occupied bin count = ", MAXVAL(bin_counts)
+
+        IF (noverflow > 0) THEN
+            PRINT *, "WARNING: STL triangle-bin overflow count = ", noverflow
+            PRINT *, "Increase stl_max_triangles_per_bin if roughness is missing locally."
+        END IF
+
+    END SUBROUTINE build_stl_triangle_bins
+
+
+    INTEGER FUNCTION uv_to_bin_index(q, qmin, qmax, nbin)
+
+        IMPLICIT NONE
+
+        REAL(8), INTENT(IN) :: q
+        REAL(8), INTENT(IN) :: qmin
+        REAL(8), INTENT(IN) :: qmax
+        INTEGER, INTENT(IN) :: nbin
+
+        REAL(8) :: qq
+
+        IF (qmax <= qmin) THEN
+            uv_to_bin_index = 1
+            RETURN
+        END IF
+
+        qq = (q-qmin)/(qmax-qmin)
+        uv_to_bin_index = 1 + INT(qq*REAL(nbin-1,8))
+        uv_to_bin_index = MAX(1, MIN(nbin, uv_to_bin_index))
+
+    END FUNCTION uv_to_bin_index
+
+
+    REAL(8) FUNCTION interpolate_stl_height_binned(query_u, query_v, ntri, &
+        t1u, t1v, t1h, t2u, t2v, t2h, t3u, t3v, t3h, &
+        umin, umax, vmin, vmax, bin_counts, bin_tris)
+
+        IMPLICIT NONE
+
+        REAL(8), INTENT(IN) :: query_u
+        REAL(8), INTENT(IN) :: query_v
+        INTEGER, INTENT(IN) :: ntri
+        REAL(8), INTENT(IN) :: t1u(:), t1v(:), t1h(:)
+        REAL(8), INTENT(IN) :: t2u(:), t2v(:), t2h(:)
+        REAL(8), INTENT(IN) :: t3u(:), t3v(:), t3h(:)
+        REAL(8), INTENT(IN) :: umin, umax, vmin, vmax
+        INTEGER, INTENT(IN) :: bin_counts(:,:)
+        INTEGER, INTENT(IN) :: bin_tris(:,:,:)
+
+        INTEGER :: nu, nv
+        INTEGER :: iu0, iv0
+        INTEGER :: iu, iv
+        INTEGER :: n
+        INTEGER :: idx
+        INTEGER :: it
+        INTEGER :: ring
+        INTEGER :: max_ring
+        INTEGER :: nearest_tri
+
+        REAL(8) :: a
+        REAL(8) :: b
+        REAL(8) :: c
+        REAL(8) :: denom
+        REAL(8) :: eps
+        REAL(8) :: cu
+        REAL(8) :: cv
+        REAL(8) :: d2
+        REAL(8) :: best_d2
+
+        nu = SIZE(bin_counts,1)
+        nv = SIZE(bin_counts,2)
+
+        iu0 = uv_to_bin_index(query_u, umin, umax, nu)
+        iv0 = uv_to_bin_index(query_v, vmin, vmax, nv)
+
+        eps = 1.0D-10
+        max_ring = MAX(nu,nv)
+
+        DO ring = 0, max_ring
+
+            DO iv = MAX(1,iv0-ring), MIN(nv,iv0+ring)
+                DO iu = MAX(1,iu0-ring), MIN(nu,iu0+ring)
+
+                    ! Only inspect the current ring boundary, not the whole
+                    ! square repeatedly.
+                    IF (ring > 0) THEN
+                        IF (ABS(iu-iu0) /= ring .AND. ABS(iv-iv0) /= ring) CYCLE
+                    END IF
+
+                    DO n = 1, bin_counts(iu,iv)
+
+                        it = bin_tris(n,iu,iv)
+
+                        IF (it <= 0) CYCLE
+
+                        denom = (t2v(it)-t3v(it))*(t1u(it)-t3u(it)) + &
+                                (t3u(it)-t2u(it))*(t1v(it)-t3v(it))
+
+                        IF (ABS(denom) <= 1.0D-30) CYCLE
+
+                        a = ((t2v(it)-t3v(it))*(query_u-t3u(it)) + &
+                             (t3u(it)-t2u(it))*(query_v-t3v(it)))/denom
+                        b = ((t3v(it)-t1v(it))*(query_u-t3u(it)) + &
+                             (t1u(it)-t3u(it))*(query_v-t3v(it)))/denom
+                        c = 1.0D0 - a - b
+
+                        IF (a >= -eps .AND. b >= -eps .AND. c >= -eps) THEN
+                            interpolate_stl_height_binned = a*t1h(it) + b*t2h(it) + c*t3h(it)
+                            RETURN
+                        END IF
+
+                    END DO
+
+                END DO
+            END DO
+
+            ! Usually the correct triangle is in the same bin or immediate
+            ! neighbours. Once a non-empty ring has been checked and no inside
+            ! triangle was found, continue expanding only a little before
+            ! falling back.
+            IF (ring >= 4) EXIT
+
+        END DO
+
+        ! Fallback: nearest triangle centre, but only over nearby bins first.
+        best_d2 = HUGE(1.0D0)
+        nearest_tri = 1
+
+        DO ring = 0, MIN(max_ring,8)
+
+            DO iv = MAX(1,iv0-ring), MIN(nv,iv0+ring)
+                DO iu = MAX(1,iu0-ring), MIN(nu,iu0+ring)
+
+                    IF (ring > 0) THEN
+                        IF (ABS(iu-iu0) /= ring .AND. ABS(iv-iv0) /= ring) CYCLE
+                    END IF
+
+                    DO n = 1, bin_counts(iu,iv)
+
+                        it = bin_tris(n,iu,iv)
+                        IF (it <= 0) CYCLE
+
+                        cu = (t1u(it)+t2u(it)+t3u(it))/3.0D0
+                        cv = (t1v(it)+t2v(it)+t3v(it))/3.0D0
+                        d2 = (query_u-cu)**2 + (query_v-cv)**2
+
+                        IF (d2 < best_d2) THEN
+                            best_d2 = d2
+                            nearest_tri = it
+                        END IF
+
+                    END DO
+
+                END DO
+            END DO
+
+            IF (best_d2 < HUGE(1.0D0)/10.0D0) EXIT
+
+        END DO
+
+        interpolate_stl_height_binned = (t1h(nearest_tri)+t2h(nearest_tri)+t3h(nearest_tri))/3.0D0
+
+    END FUNCTION interpolate_stl_height_binned
+
+
+    REAL(8) FUNCTION interpolate_stl_height(query_u, query_v, ntri, &
+        t1u, t1v, t1h, t2u, t2v, t2h, t3u, t3v, t3h)
+
+        IMPLICIT NONE
+
+        REAL(8), INTENT(IN) :: query_u
+        REAL(8), INTENT(IN) :: query_v
+        INTEGER, INTENT(IN) :: ntri
+        REAL(8), INTENT(IN) :: t1u(:), t1v(:), t1h(:)
+        REAL(8), INTENT(IN) :: t2u(:), t2v(:), t2h(:)
+        REAL(8), INTENT(IN) :: t3u(:), t3v(:), t3h(:)
+
+        INTEGER :: it
+        INTEGER :: nearest_tri
+        REAL(8) :: a
+        REAL(8) :: b
+        REAL(8) :: c
+        REAL(8) :: denom
+        REAL(8) :: d2
+        REAL(8) :: best_d2
+        REAL(8) :: cu
+        REAL(8) :: cv
+        REAL(8) :: eps
+
+        eps = 1.0D-10
+
+        DO it=1,ntri
+            denom = (t2v(it)-t3v(it))*(t1u(it)-t3u(it)) + &
+                    (t3u(it)-t2u(it))*(t1v(it)-t3v(it))
+
+            IF (ABS(denom) <= 1.0D-30) CYCLE
+
+            a = ((t2v(it)-t3v(it))*(query_u-t3u(it)) + &
+                 (t3u(it)-t2u(it))*(query_v-t3v(it)))/denom
+            b = ((t3v(it)-t1v(it))*(query_u-t3u(it)) + &
+                 (t1u(it)-t3u(it))*(query_v-t3v(it)))/denom
+            c = 1.0D0 - a - b
+
+            IF (a >= -eps .AND. b >= -eps .AND. c >= -eps) THEN
+                interpolate_stl_height = a*t1h(it) + b*t2h(it) + c*t3h(it)
+                RETURN
+            END IF
+        END DO
+
+        ! Fallback for query points just outside the STL triangulation.
+        ! Use nearest triangle-centre height rather than returning zero.
+        best_d2 = HUGE(1.0D0)
+        nearest_tri = 1
+
+        DO it=1,ntri
+            cu = (t1u(it)+t2u(it)+t3u(it))/3.0D0
+            cv = (t1v(it)+t2v(it)+t3v(it))/3.0D0
+            d2 = (query_u-cu)**2 + (query_v-cv)**2
+            IF (d2 < best_d2) THEN
+                best_d2 = d2
+                nearest_tri = it
+            END IF
+        END DO
+
+        interpolate_stl_height = (t1h(nearest_tri)+t2h(nearest_tri)+t3h(nearest_tri))/3.0D0
+
+    END FUNCTION interpolate_stl_height
+
+
+    SUBROUTINE compute_surface_arclength(xline, yline, s)
+
+        IMPLICIT NONE
+
+        REAL(8), INTENT(IN) :: xline(:)
+        REAL(8), INTENT(IN) :: yline(:)
+        REAL(8), INTENT(OUT) :: s(:)
+
+        INTEGER :: i
+        INTEGER :: n
+        REAL(8) :: ds
+
+        n = SIZE(xline)
+
+        s(1) = 0.0D0
+
+        DO i = 2, n
+            ds = SQRT((xline(i)-xline(i-1))**2 + (yline(i)-yline(i-1))**2)
+            s(i) = s(i-1) + ds
+        END DO
+
+    END SUBROUTINE compute_surface_arclength
+
+
+    SUBROUTINE compute_curve_normals(xline, yline, nx, ny)
+
+        IMPLICIT NONE
+
+        REAL(8), INTENT(IN) :: xline(:)
+        REAL(8), INTENT(IN) :: yline(:)
+        REAL(8), INTENT(OUT) :: nx(:)
+        REAL(8), INTENT(OUT) :: ny(:)
+
+        INTEGER :: i
+        INTEGER :: n
+
+        REAL(8) :: tx
+        REAL(8) :: ty
+        REAL(8) :: mag
+
+        n = SIZE(xline)
+
+        DO i = 1, n
+
+            IF (i == 1) THEN
+                tx = xline(2) - xline(1)
+                ty = yline(2) - yline(1)
+            ELSE IF (i == n) THEN
+                tx = xline(n) - xline(n-1)
+                ty = yline(n) - yline(n-1)
+            ELSE
+                tx = xline(i+1) - xline(i-1)
+                ty = yline(i+1) - yline(i-1)
+            END IF
+
+            mag = SQRT(tx*tx + ty*ty)
+
+            IF (mag > 1.0D-14) THEN
+                tx = tx/mag
+                ty = ty/mag
+
+                ! If the STL roughness goes into the wrong side of the blade, flip the
+                ! sign of stl_height_sign.
+                nx(i) = -ty
+                ny(i) =  tx
+            ELSE
+                nx(i) = 0.0D0
+                ny(i) = 0.0D0
+            END IF
+
+        END DO
+
+    END SUBROUTINE compute_curve_normals
+
+
+
+    LOGICAL FUNCTION keep_hex_cell(i, j, nc_i, nc_j)
+        IMPLICIT NONE
+        INTEGER, INTENT(IN) :: i, j, nc_i, nc_j
+
+        keep_hex_cell = &
+            (i <= nhex_layers) .OR. &
+            (i >= nc_i - nhex_layers + 1) .OR. &
+            (j >= nc_j - nhex_layers + 1)
+    END FUNCTION keep_hex_cell
+
+
+    LOGICAL FUNCTION keep_pyramid_cell(i, j, nc_i, nc_j)
+        IMPLICIT NONE
+        INTEGER, INTENT(IN) :: i, j, nc_i, nc_j
+
+        ! Three-cell-deep pyramid transition immediately inside the 5-cell shell.
+        keep_pyramid_cell = .FALSE.
+
+        IF (keep_hex_cell(i, j, nc_i, nc_j)) RETURN
+
+        IF (i > nhex_layers .AND. i <= nhex_layers + npyramid_layers) THEN
+            keep_pyramid_cell = .TRUE.
+        END IF
+
+        IF (i < nc_i - nhex_layers + 1 .AND. &
+            i >= nc_i - nhex_layers - npyramid_layers + 1) THEN
+            keep_pyramid_cell = .TRUE.
+        END IF
+
+        IF (j < nc_j - nhex_layers + 1 .AND. &
+            j >= nc_j - nhex_layers - npyramid_layers + 1) THEN
+            keep_pyramid_cell = .TRUE.
+        END IF
+
+    END FUNCTION keep_pyramid_cell
+
+
+
+    SUBROUTINE build_generated_coordinates(xold,yold,zold,xg,yg,zg)
+        IMPLICIT NONE
+        REAL(8), INTENT(IN)  :: xold(:,:,:), yold(:,:,:), zold(:,:,:)
+        REAL(8), INTENT(OUT) :: xg(:,:,:), yg(:,:,:), zg(:,:,:)
+
+        INTEGER :: ni,nj,nk
+        INTEGER :: i,j,k
+        INTEGER :: i_left_inner, i_right_inner, j_top_inner
+        INTEGER :: i_left_guide, i_right_guide, j_top_guide
+        REAL(8) :: s, xi, eta
+
+        REAL(8) :: xl,yl,zl,xr,yr,zr,xb,yb,zb,xt,yt,zt
+        REAL(8) :: xlb,ylb,zlb,xrb,yrb,zrb,xlt,ylt,zlt,xrt,yrt,zrt
+
+        REAL(8), ALLOCATABLE :: xbline(:), ybline(:), zbline(:)
+
+        ni=SIZE(xold,1)
+        nj=SIZE(xold,2)
+        nk=SIZE(xold,3)
+
+        xg = xold
+        yg = yold
+        zg = zold
+
+        ! Cell shell thickness = nhex_layers.
+        !
+        ! Node layer 1/2 of each shell is copied exactly from the old mesh.
+        ! Remaining shell nodes are interpolated towards a guide node from the
+        ! old mesh. The guide prevents the straight-line extrapolation that was
+        ! causing folded cells.
+        !
+        ! For i-min:
+        !   old i=1,2 are exact.
+        !   old i=nhex_layers+1 is used only as an inner guide.
+        !
+        ! For i-max:
+        !   old i=ni,ni-1 are exact.
+        !   old i=ni-nhex_layers is used only as an inner guide.
+        !
+        ! For j-max:
+        !   old j=nj,nj-1 are exact.
+        !   old j=nj-nhex_layers is used only as an inner guide.
+        i_left_inner  = nhex_layers + 1
+        i_right_inner = ni - nhex_layers
+        j_top_inner   = nj - nhex_layers
+
+        i_left_guide  = nhex_layers + 1
+        i_right_guide = ni - nhex_layers
+        j_top_guide   = nj - nhex_layers
+
+        ALLOCATE(xbline(i_right_inner-i_left_inner+1))
+        ALLOCATE(ybline(i_right_inner-i_left_inner+1))
+        ALLOCATE(zbline(i_right_inner-i_left_inner+1))
+
+        DO k=1,nk
+
+            !--------------------------------------------------------------
+            ! i-min 5-layer shell.
+            ! First cell: old i=1:2 exactly.
+            ! Layers 2-5: generated by bounded interpolation from old i=2
+            !             to old i=6 guide, not raw extrapolation.
+            !--------------------------------------------------------------
+            DO j=1,nj
+
+                xg(1,j,k)=xold(1,j,k)
+                yg(1,j,k)=yold(1,j,k)
+                zg(1,j,k)=zold(1,j,k)
+
+                xg(2,j,k)=xold(2,j,k)
+                yg(2,j,k)=yold(2,j,k)
+                zg(2,j,k)=zold(2,j,k)
+
+                DO i=3,i_left_inner
+                    s = REAL(i-2,8)/REAL(i_left_inner-2,8)
+                    xg(i,j,k) = (1.0D0-s)*xold(2,j,k) + s*xold(i_left_guide,j,k)
+                    yg(i,j,k) = (1.0D0-s)*yold(2,j,k) + s*yold(i_left_guide,j,k)
+                    zg(i,j,k) = (1.0D0-s)*zold(2,j,k) + s*zold(i_left_guide,j,k)
+                END DO
+
+            END DO
+
+            !--------------------------------------------------------------
+            ! i-max 5-layer shell.
+            ! First cell: old i=ni-1:ni exactly.
+            ! Layers 2-5: generated by bounded interpolation from old ni-1
+            !             to old ni-5 guide.
+            !--------------------------------------------------------------
+            DO j=1,nj
+
+                xg(ni,j,k)=xold(ni,j,k)
+                yg(ni,j,k)=yold(ni,j,k)
+                zg(ni,j,k)=zold(ni,j,k)
+
+                xg(ni-1,j,k)=xold(ni-1,j,k)
+                yg(ni-1,j,k)=yold(ni-1,j,k)
+                zg(ni-1,j,k)=zold(ni-1,j,k)
+
+                DO i=i_right_inner,ni-2
+                    s = REAL((ni-1)-i,8)/REAL((ni-1)-i_right_inner,8)
+                    xg(i,j,k) = (1.0D0-s)*xold(ni-1,j,k) + s*xold(i_right_guide,j,k)
+                    yg(i,j,k) = (1.0D0-s)*yold(ni-1,j,k) + s*yold(i_right_guide,j,k)
+                    zg(i,j,k) = (1.0D0-s)*zold(ni-1,j,k) + s*zold(i_right_guide,j,k)
+                END DO
+
+            END DO
+
+            !--------------------------------------------------------------
+            ! j-max 5-layer shell.
+            ! First cell: old j=nj-1:nj exactly.
+            ! Layers 2-5: generated by bounded interpolation from old nj-1
+            !             to old nj-5 guide.
+            ! Only overwrite the middle i-range; side shells keep priority.
+            !--------------------------------------------------------------
+            DO i=i_left_inner,i_right_inner
+
+                xg(i,nj,k)=xold(i,nj,k)
+                yg(i,nj,k)=yold(i,nj,k)
+                zg(i,nj,k)=zold(i,nj,k)
+
+                xg(i,nj-1,k)=xold(i,nj-1,k)
+                yg(i,nj-1,k)=yold(i,nj-1,k)
+                zg(i,nj-1,k)=zold(i,nj-1,k)
+
+                DO j=j_top_inner,nj-2
+                    s = REAL((nj-1)-j,8)/REAL((nj-1)-j_top_inner,8)
+                    xg(i,j,k) = (1.0D0-s)*xold(i,nj-1,k) + s*xold(i,j_top_guide,k)
+                    yg(i,j,k) = (1.0D0-s)*yold(i,nj-1,k) + s*yold(i,j_top_guide,k)
+                    zg(i,j,k) = (1.0D0-s)*zold(i,nj-1,k) + s*zold(i,j_top_guide,k)
+                END DO
+
+            END DO
+
+            !--------------------------------------------------------------
+            ! Redistributed blade-side curve for the remaining pyramid region.
+            ! This is only for the interior fill; the retained i-side shell
+            ! endpoints stay tied to the generated shell boundaries.
+            !--------------------------------------------------------------
+            CALL resample_curve_uniform_arclength( &
+                xold(i_left_inner:i_right_inner,1,k), &
+                yold(i_left_inner:i_right_inner,1,k), &
+                zold(i_left_inner:i_right_inner,1,k), &
+                xbline, ybline, zbline &
+            )
+
+            xbline(1) = xg(i_left_inner,1,k)
+            ybline(1) = yg(i_left_inner,1,k)
+            zbline(1) = zg(i_left_inner,1,k)
+
+            xbline(SIZE(xbline)) = xg(i_right_inner,1,k)
+            ybline(SIZE(ybline)) = yg(i_right_inner,1,k)
+            zbline(SIZE(zbline)) = zg(i_right_inner,1,k)
+
+            !--------------------------------------------------------------
+            ! TFI for remaining interior pyramid-fill nodes.
+            ! Fill only the open region bounded by:
+            !   i = i_left_inner
+            !   i = i_right_inner
+            !   j = 1
+            !   j = j_top_inner
+            !--------------------------------------------------------------
+            xlb=xg(i_left_inner,1,k)
+            ylb=yg(i_left_inner,1,k)
+            zlb=zg(i_left_inner,1,k)
+
+            xrb=xg(i_right_inner,1,k)
+            yrb=yg(i_right_inner,1,k)
+            zrb=zg(i_right_inner,1,k)
+
+            xlt=xg(i_left_inner,j_top_inner,k)
+            ylt=yg(i_left_inner,j_top_inner,k)
+            zlt=zg(i_left_inner,j_top_inner,k)
+
+            xrt=xg(i_right_inner,j_top_inner,k)
+            yrt=yg(i_right_inner,j_top_inner,k)
+            zrt=zg(i_right_inner,j_top_inner,k)
+
+            DO j=1,j_top_inner
+                eta = REAL(j-1,8)/REAL(j_top_inner-1,8)
+
+                DO i=i_left_inner,i_right_inner
+                    xi = REAL(i-i_left_inner,8)/REAL(i_right_inner-i_left_inner,8)
+
+                    xl=xg(i_left_inner,j,k)
+                    yl=yg(i_left_inner,j,k)
+                    zl=zg(i_left_inner,j,k)
+
+                    xr=xg(i_right_inner,j,k)
+                    yr=yg(i_right_inner,j,k)
+                    zr=zg(i_right_inner,j,k)
+
+                    xb=xbline(i-i_left_inner+1)
+                    yb=ybline(i-i_left_inner+1)
+                    zb=zbline(i-i_left_inner+1)
+
+                    xt=xg(i,j_top_inner,k)
+                    yt=yg(i,j_top_inner,k)
+                    zt=zg(i,j_top_inner,k)
+
+                    xg(i,j,k) = (1.0D0-xi)*xl + xi*xr + &
+                                (1.0D0-eta)*xb + eta*xt - &
+                                ((1.0D0-xi)*(1.0D0-eta)*xlb + &
+                                 xi*(1.0D0-eta)*xrb + &
+                                 (1.0D0-xi)*eta*xlt + &
+                                 xi*eta*xrt)
+
+                    yg(i,j,k) = (1.0D0-xi)*yl + xi*yr + &
+                                (1.0D0-eta)*yb + eta*yt - &
+                                ((1.0D0-xi)*(1.0D0-eta)*ylb + &
+                                 xi*(1.0D0-eta)*yrb + &
+                                 (1.0D0-xi)*eta*ylt + &
+                                 xi*eta*yrt)
+
+                    zg(i,j,k) = (1.0D0-xi)*zl + xi*zr + &
+                                (1.0D0-eta)*zb + eta*zt - &
+                                ((1.0D0-xi)*(1.0D0-eta)*zlb + &
+                                 xi*(1.0D0-eta)*zrb + &
+                                 (1.0D0-xi)*eta*zlt + &
+                                 xi*eta*zrt)
+                END DO
+            END DO
+
+            IF (enforce_blade_normal_gridlines) THEN
+                CALL enforce_blade_normal_gridlines_for_k( &
+                    xg, yg, zg, k, i_left_inner, i_right_inner, j_top_inner &
+                )
+            END IF
+
+        END DO
+
+        DEALLOCATE(xbline,ybline,zbline)
+    END SUBROUTINE build_generated_coordinates
+
+
+
+    SUBROUTINE enforce_blade_normal_gridlines_for_k(xg, yg, zg, kslice, i_left, i_right, j_top_inner)
+
+        ! Rebuild generated near-wall j-lines so that:
+        !
+        !   1. the line starts at the roughened blade wall point,
+        !   2. the derivative at the wall is parallel to the ORIGINAL smooth
+        !      blade normal,
+        !   3. the line smoothly reaches the existing pyramid-transition point,
+        !   4. the tangential recovery is spread over the whole distance to the
+        !      pyramid layer, rather than being squeezed into only a few layers.
+        !
+        ! This removes the near-wall waviness/kink from the previous local
+        ! enforcement method.
+        !
+        ! Construction:
+        !
+        !   Rwall  = roughened blade wall point
+        !   Rtop   = already-generated point at j_anchor
+        !   n      = original smooth blade normal
+        !   A      = Rtop - Rwall
+        !   d      = A dot n
+        !   T      = A - d*n
+        !
+        !   R(eta) = Rwall + eta*d*n + S(eta)*T
+        !
+        ! where S is the quintic smootherstep:
+        !
+        !   S(eta) = 10 eta^3 - 15 eta^4 + 6 eta^5
+        !
+        ! S'(0)=0, so the line is exactly normal at the blade surface.
+        ! S'(1)=0, so it joins the pyramid-transition location smoothly.
+        !
+        ! Compared with the old version, this uses j_anchor = j_top_inner by
+        ! default, so the curve is smooth over the full generated region.
+
+        IMPLICIT NONE
+
+        REAL(8), INTENT(INOUT) :: xg(:,:,:)
+        REAL(8), INTENT(INOUT) :: yg(:,:,:)
+        REAL(8), INTENT(INOUT) :: zg(:,:,:)
+        INTEGER, INTENT(IN) :: kslice
+        INTEGER, INTENT(IN) :: i_left
+        INTEGER, INTENT(IN) :: i_right
+        INTEGER, INTENT(IN) :: j_top_inner
+
+        INTEGER :: i
+        INTEGER :: j
+        INTEGER :: j_anchor
+        INTEGER :: enforced_node_layers
+
+        REAL(8) :: bx
+        REAL(8) :: by
+        REAL(8) :: bz
+
+        REAL(8) :: ax
+        REAL(8) :: ay
+        REAL(8) :: az
+
+        REAL(8) :: nxv
+        REAL(8) :: nyv
+        REAL(8) :: nzv
+        REAL(8) :: nmag
+
+        REAL(8) :: avx
+        REAL(8) :: avy
+        REAL(8) :: avz
+
+        REAL(8) :: dnormal
+        REAL(8) :: tangx
+        REAL(8) :: tangy
+        REAL(8) :: tangz
+
+        REAL(8) :: eta
+        REAL(8) :: blend
+
+        IF (.NOT. original_blade_normals_available) THEN
+            PRINT *, "ERROR: original blade normals were not stored before roughness."
+            PRINT *, "Cannot enforce original-blade-normal smooth grid lines."
+            STOP 1
+        END IF
+
+        IF (blade_normal_blend_to_pyramid_layer) THEN
+            j_anchor = j_top_inner
+        ELSE
+            enforced_node_layers = blade_normal_enforced_cell_layers + 1
+            enforced_node_layers = MAX(2, enforced_node_layers)
+            enforced_node_layers = MIN(enforced_node_layers, j_top_inner)
+            j_anchor = enforced_node_layers
+        END IF
+
+        IF (j_anchor <= 2) RETURN
+
+        DO i = i_left, i_right
+
+            bx = xg(i,1,kslice)
+            by = yg(i,1,kslice)
+            bz = zg(i,1,kslice)
+
+            ax = xg(i,j_anchor,kslice)
+            ay = yg(i,j_anchor,kslice)
+            az = zg(i,j_anchor,kslice)
+
+            ! Original smooth blade normal in the x-y plane.
+            nxv = original_blade_nx(i,kslice)
+            nyv = original_blade_ny(i,kslice)
+            nzv = 0.0D0
+
+            nmag = SQRT(nxv*nxv + nyv*nyv + nzv*nzv)
+
+            IF (nmag <= 1.0D-14) CYCLE
+
+            nxv = nxv/nmag
+            nyv = nyv/nmag
+            nzv = nzv/nmag
+
+            avx = ax - bx
+            avy = ay - by
+            avz = az - bz
+
+            ! Orient the original normal into the existing interior.
+            IF (avx*nxv + avy*nyv + avz*nzv < 0.0D0) THEN
+                nxv = -nxv
+                nyv = -nyv
+                nzv = -nzv
+            END IF
+
+            dnormal = avx*nxv + avy*nyv + avz*nzv
+
+            IF (dnormal <= 1.0D-14) THEN
+                dnormal = SQRT(avx*avx + avy*avy + avz*avz)
+            END IF
+
+            ! Tangential difference between the old pyramid-transition point
+            ! and the pure normal projection. This is recovered smoothly over
+            ! the full distance, not locally near the wall.
+            tangx = avx - dnormal*nxv
+            tangy = avy - dnormal*nyv
+            tangz = avz - dnormal*nzv
+
+            DO j = 2, j_anchor
+
+                eta = REAL(j-1,8)/REAL(j_anchor-1,8)
+
+                ! Quintic smootherstep:
+                ! S(0)=0, S(1)=1, S'(0)=S'(1)=0, S''(0)=S''(1)=0
+                blend = eta*eta*eta*(10.0D0 - 15.0D0*eta + 6.0D0*eta*eta)
+
+                xg(i,j,kslice) = bx + eta*dnormal*nxv + blend*tangx
+                yg(i,j,kslice) = by + eta*dnormal*nyv + blend*tangy
+                zg(i,j,kslice) = bz + eta*dnormal*nzv + blend*tangz
+
+            END DO
+
+        END DO
+
+    END SUBROUTINE enforce_blade_normal_gridlines_for_k
+
+
+    SUBROUTINE local_surface_tangent_i(xg, yg, zg, i, kslice, tx, ty, tz)
+
+        IMPLICIT NONE
+
+        REAL(8), INTENT(IN) :: xg(:,:,:)
+        REAL(8), INTENT(IN) :: yg(:,:,:)
+        REAL(8), INTENT(IN) :: zg(:,:,:)
+        INTEGER, INTENT(IN) :: i
+        INTEGER, INTENT(IN) :: kslice
+        REAL(8), INTENT(OUT) :: tx
+        REAL(8), INTENT(OUT) :: ty
+        REAL(8), INTENT(OUT) :: tz
+
+        INTEGER :: ni
+        INTEGER :: im
+        INTEGER :: ip
+
+        ni = SIZE(xg,1)
+
+        IF (i <= 1) THEN
+            im = 1
+            ip = 2
+        ELSE IF (i >= ni) THEN
+            im = ni-1
+            ip = ni
+        ELSE
+            im = i-1
+            ip = i+1
+        END IF
+
+        tx = xg(ip,1,kslice) - xg(im,1,kslice)
+        ty = yg(ip,1,kslice) - yg(im,1,kslice)
+        tz = zg(ip,1,kslice) - zg(im,1,kslice)
+
+    END SUBROUTINE local_surface_tangent_i
+
+
+    SUBROUTINE local_surface_tangent_k(xg, yg, zg, i, kslice, tx, ty, tz)
+
+        IMPLICIT NONE
+
+        REAL(8), INTENT(IN) :: xg(:,:,:)
+        REAL(8), INTENT(IN) :: yg(:,:,:)
+        REAL(8), INTENT(IN) :: zg(:,:,:)
+        INTEGER, INTENT(IN) :: i
+        INTEGER, INTENT(IN) :: kslice
+        REAL(8), INTENT(OUT) :: tx
+        REAL(8), INTENT(OUT) :: ty
+        REAL(8), INTENT(OUT) :: tz
+
+        INTEGER :: nk
+        INTEGER :: km
+        INTEGER :: kp
+
+        nk = SIZE(xg,3)
+
+        IF (nk <= 1) THEN
+            tx = 0.0D0
+            ty = 0.0D0
+            tz = 1.0D0
+            RETURN
+        END IF
+
+        IF (kslice <= 1) THEN
+            km = 1
+            kp = 2
+        ELSE IF (kslice >= nk) THEN
+            km = nk-1
+            kp = nk
+        ELSE
+            km = kslice-1
+            kp = kslice+1
+        END IF
+
+        tx = xg(i,1,kp) - xg(i,1,km)
+        ty = yg(i,1,kp) - yg(i,1,km)
+        tz = zg(i,1,kp) - zg(i,1,km)
+
+    END SUBROUTINE local_surface_tangent_k
+
+
+    SUBROUTINE fallback_2d_blade_normal(xg, yg, zg, i, kslice, nxv, nyv, nzv)
+
+        IMPLICIT NONE
+
+        REAL(8), INTENT(IN) :: xg(:,:,:)
+        REAL(8), INTENT(IN) :: yg(:,:,:)
+        REAL(8), INTENT(IN) :: zg(:,:,:)
+        INTEGER, INTENT(IN) :: i
+        INTEGER, INTENT(IN) :: kslice
+        REAL(8), INTENT(OUT) :: nxv
+        REAL(8), INTENT(OUT) :: nyv
+        REAL(8), INTENT(OUT) :: nzv
+
+        INTEGER :: ni
+        INTEGER :: im
+        INTEGER :: ip
+        REAL(8) :: tx
+        REAL(8) :: ty
+        REAL(8) :: mag
+
+        ni = SIZE(xg,1)
+
+        IF (i <= 1) THEN
+            im = 1
+            ip = 2
+        ELSE IF (i >= ni) THEN
+            im = ni-1
+            ip = ni
+        ELSE
+            im = i-1
+            ip = i+1
+        END IF
+
+        tx = xg(ip,1,kslice) - xg(im,1,kslice)
+        ty = yg(ip,1,kslice) - yg(im,1,kslice)
+
+        mag = SQRT(tx*tx + ty*ty)
+
+        IF (mag > 1.0D-14) THEN
+            nxv = -ty/mag
+            nyv =  tx/mag
+            nzv =  0.0D0
+        ELSE
+            nxv = 0.0D0
+            nyv = 0.0D0
+            nzv = 0.0D0
+        END IF
+
+    END SUBROUTINE fallback_2d_blade_normal
+
+
+
+    SUBROUTINE resample_curve_uniform_arclength(xin,yin,zin,xout,yout,zout)
+        IMPLICIT NONE
+        REAL(8), INTENT(IN)  :: xin(:), yin(:), zin(:)
+        REAL(8), INTENT(OUT) :: xout(:), yout(:), zout(:)
+
+        INTEGER :: n,i,m
+        REAL(8), ALLOCATABLE :: s(:)
+        REAL(8) :: ds,total_s,target_s,t
+
+        n=SIZE(xin)
+        ALLOCATE(s(n))
+        s(1)=0.0D0
+
+        DO i=2,n
+            ds=SQRT((xin(i)-xin(i-1))**2 + (yin(i)-yin(i-1))**2 + (zin(i)-zin(i-1))**2)
+            s(i)=s(i-1)+ds
+        END DO
+
+        total_s=s(n)
+
+        IF (total_s <= 1.0D-14) THEN
+            xout=xin; yout=yin; zout=zin
+            DEALLOCATE(s)
+            RETURN
+        END IF
+
+        xout(1)=xin(1); yout(1)=yin(1); zout(1)=zin(1)
+        xout(n)=xin(n); yout(n)=yin(n); zout(n)=zin(n)
+
+        m=1
+        DO i=2,n-1
+            target_s=total_s*REAL(i-1,8)/REAL(n-1,8)
+
+            DO WHILE (m < n-1 .AND. s(m+1) < target_s)
+                m=m+1
+            END DO
+
+            IF (s(m+1) > s(m)) THEN
+                t=(target_s-s(m))/(s(m+1)-s(m))
+            ELSE
+                t=0.0D0
+            END IF
+
+            xout(i)=(1.0D0-t)*xin(m)+t*xin(m+1)
+            yout(i)=(1.0D0-t)*yin(m)+t*yin(m+1)
+            zout(i)=(1.0D0-t)*zin(m)+t*zin(m+1)
+        END DO
+
+        DEALLOCATE(s)
+    END SUBROUTINE resample_curve_uniform_arclength
+
+
+    INTEGER FUNCTION node_id(i,j,k,ni,nj)
+        IMPLICIT NONE
+        INTEGER, INTENT(IN) :: i,j,k,ni,nj
+        node_id = i + (j-1)*ni + (k-1)*ni*nj
+    END FUNCTION node_id
+
+
+    SUBROUTINE get_hex_corner_nodes(i,j,k,ni,nj,n000,n100,n110,n010,n001,n101,n111,n011)
+        IMPLICIT NONE
+        INTEGER, INTENT(IN) :: i,j,k,ni,nj
+        INTEGER, INTENT(OUT) :: n000,n100,n110,n010,n001,n101,n111,n011
+
+        n000=node_id(i,  j,  k,  ni,nj)
+        n100=node_id(i+1,j,  k,  ni,nj)
+        n110=node_id(i+1,j+1,k,  ni,nj)
+        n010=node_id(i,  j+1,k,  ni,nj)
+        n001=node_id(i,  j,  k+1,ni,nj)
+        n101=node_id(i+1,j,  k+1,ni,nj)
+        n111=node_id(i+1,j+1,k+1,ni,nj)
+        n011=node_id(i,  j+1,k+1,ni,nj)
+    END SUBROUTINE get_hex_corner_nodes
+
+
+    LOGICAL FUNCTION keep_tet_cell(i,j,nc_i,nc_j)
+        IMPLICIT NONE
+        INTEGER, INTENT(IN) :: i,j,nc_i,nc_j
+
+        keep_tet_cell = (.NOT. keep_hex_cell(i,j,nc_i,nc_j)) .AND. &
+                        (.NOT. keep_pyramid_cell(i,j,nc_i,nc_j))
+    END FUNCTION keep_tet_cell
+
+
+
+    SUBROUTINE count_pyramid_face_types(i,j,k,nc_i,nc_j,nc_k, n_pyra_faces, n_bisected_faces)
+        IMPLICIT NONE
+        INTEGER, INTENT(IN) :: i,j,k,nc_i,nc_j,nc_k
+        INTEGER, INTENT(OUT) :: n_pyra_faces, n_bisected_faces
+        INTEGER :: face
+
+        n_pyra_faces = 0
+        n_bisected_faces = 0
+
+        DO face = 1, 6
+            IF (face_touches_tet(i,j,k,face,nc_i,nc_j,nc_k)) THEN
+                n_bisected_faces = n_bisected_faces + 1
+            ELSE
+                n_pyra_faces = n_pyra_faces + 1
+            END IF
+        END DO
+    END SUBROUTINE count_pyramid_face_types
+
+
+    LOGICAL FUNCTION face_touches_tet(i,j,k,face,nc_i,nc_j,nc_k)
+        IMPLICIT NONE
+        INTEGER, INTENT(IN) :: i,j,k,face,nc_i,nc_j,nc_k
+        INTEGER :: ia, ja, ka
+
+        ia = i
+        ja = j
+        ka = k
+
+        SELECT CASE(face)
+        CASE(FACE_IMIN)
+            ia = i - 1
+        CASE(FACE_IMAX)
+            ia = i + 1
+        CASE(FACE_JMIN)
+            ja = j - 1
+        CASE(FACE_JMAX)
+            ja = j + 1
+        CASE(FACE_KMIN)
+            ka = k - 1
+        CASE(FACE_KMAX)
+            ka = k + 1
+        CASE DEFAULT
+            face_touches_tet = .FALSE.
+            RETURN
+        END SELECT
+
+        IF (ia < 1 .OR. ia > nc_i .OR. &
+            ja < 1 .OR. ja > nc_j .OR. &
+            ka < 1 .OR. ka > nc_k) THEN
+            face_touches_tet = .FALSE.
+        ELSE
+            face_touches_tet = keep_tet_cell(ia,ja,nc_i,nc_j)
+        END IF
+
+    END FUNCTION face_touches_tet
+
+
+    SUBROUTINE add_pyramid_or_interface_tets(pyr_conn, epyr, tet_conn, etet, &
+        face_code, split_to_tets, n1,n2,n3,n4,apex)
+
+        IMPLICIT NONE
+        INTEGER(KIND=cgsize_t), INTENT(INOUT) :: pyr_conn(:)
+        INTEGER(KIND=cgsize_t), INTENT(INOUT) :: tet_conn(:)
+        INTEGER, INTENT(INOUT) :: epyr
+        INTEGER, INTENT(INOUT) :: etet
+        INTEGER, INTENT(IN) :: face_code
+        LOGICAL, INTENT(IN) :: split_to_tets
+        INTEGER, INTENT(IN) :: n1,n2,n3,n4,apex
+
+        IF (.NOT. split_to_tets) THEN
+            CALL add_pyramid(pyr_conn, epyr, n1,n2,n3,n4,apex)
+            RETURN
+        END IF
+
+        ! Split the face-pyramid into two tetrahedra. The chosen diagonal must
+        ! match the Freudenthal triangulation of the neighbouring tetra cell's
+        ! shared face:
+        !   i-min: 000--011
+        !   i-max: 100--111
+        !   j-min: 000--101
+        !   j-max: 010--111
+        !   k-min: 000--110
+        !   k-max: 001--111
+        ! The node ordering passed by the caller is arranged so the matching
+        ! diagonal is always n1--n3 for the given face.
+        SELECT CASE(face_code)
+        CASE(FACE_IMIN, FACE_IMAX, FACE_JMIN, FACE_JMAX, FACE_KMIN, FACE_KMAX)
+            CALL add_tet(tet_conn, etet, apex, n1, n2, n3)
+            CALL add_tet(tet_conn, etet, apex, n1, n3, n4)
+        CASE DEFAULT
+            PRINT *, "ERROR: invalid face_code in add_pyramid_or_interface_tets = ", face_code
+            STOP 1
+        END SELECT
+
+    END SUBROUTINE add_pyramid_or_interface_tets
+
+
+    SUBROUTINE build_tet_connectivity(tet_conn, etet, ntet, ni, nj, nk, nc_i, nc_j, nc_k)
+        IMPLICIT NONE
+        INTEGER(KIND=cgsize_t), INTENT(INOUT) :: tet_conn(:)
+        INTEGER, INTENT(INOUT) :: etet
+        INTEGER, INTENT(IN) :: ntet
+        INTEGER, INTENT(IN) :: ni, nj, nk, nc_i, nc_j, nc_k
+
+        INTEGER :: i, j, k
+        INTEGER :: n000,n100,n110,n010,n001,n101,n111,n011
+
+        DO k=1,nc_k
+            DO j=1,nc_j
+                DO i=1,nc_i
+
+                    IF (.NOT. keep_tet_cell(i,j,nc_i,nc_j)) CYCLE
+
+                    CALL get_hex_corner_nodes(i,j,k,ni,nj, &
+                        n000,n100,n110,n010,n001,n101,n111,n011)
+
+                    ! Fixed Freudenthal/Kuhn split.
+                    ! Keep the same diagonal in every cell.
+                    CALL add_tet(tet_conn, etet, n000, n100, n110, n111)
+                    CALL add_tet(tet_conn, etet, n000, n100, n101, n111)
+                    CALL add_tet(tet_conn, etet, n000, n010, n110, n111)
+                    CALL add_tet(tet_conn, etet, n000, n010, n011, n111)
+                    CALL add_tet(tet_conn, etet, n000, n001, n101, n111)
+                    CALL add_tet(tet_conn, etet, n000, n001, n011, n111)
+
+                END DO
+            END DO
+        END DO
+
+        IF (etet /= ntet) THEN
+            PRINT *, "ERROR: tet count mismatch."
+            PRINT *, "etet, ntet = ", etet, ntet
+            STOP 1
+        END IF
+
+        PRINT *, "Verified strict tetra count: 6 tetrahedra per tetra-core logical cell."
+
+    END SUBROUTINE build_tet_connectivity
+
+
+    SUBROUTINE add_tet(conn, etet, n1,n2,n3,n4)
+        IMPLICIT NONE
+        INTEGER(KIND=cgsize_t), INTENT(INOUT) :: conn(:)
+        INTEGER, INTENT(INOUT) :: etet
+        INTEGER, INTENT(IN) :: n1,n2,n3,n4
+
+        IF (n1 <= 0 .OR. n2 <= 0 .OR. n3 <= 0 .OR. n4 <= 0) THEN
+            PRINT *, "ERROR: invalid tet node ids: ", n1,n2,n3,n4
+            STOP 1
+        END IF
+
+        etet=etet+1
+        conn(4*etet-3)=INT(n1,KIND=cgsize_t)
+        conn(4*etet-2)=INT(n2,KIND=cgsize_t)
+        conn(4*etet-1)=INT(n3,KIND=cgsize_t)
+        conn(4*etet)=INT(n4,KIND=cgsize_t)
+    END SUBROUTINE add_tet
+
+
+    SUBROUTINE add_pyramid(conn, epyr, n1,n2,n3,n4,apex)
+        IMPLICIT NONE
+        INTEGER(KIND=cgsize_t), INTENT(INOUT) :: conn(:)
+        INTEGER, INTENT(INOUT) :: epyr
+        INTEGER, INTENT(IN) :: n1,n2,n3,n4,apex
+
+        epyr=epyr+1
+        conn(5*epyr-4)=INT(n1,KIND=cgsize_t)
+        conn(5*epyr-3)=INT(n2,KIND=cgsize_t)
+        conn(5*epyr-2)=INT(n3,KIND=cgsize_t)
+        conn(5*epyr-1)=INT(n4,KIND=cgsize_t)
+        conn(5*epyr)  =INT(apex,KIND=cgsize_t)
+    END SUBROUTINE add_pyramid
+
+
+
+
+    SUBROUTINE write_all_tetrahedral_hybrid_block6(output_file_name, xg, yg, zg, ni, nj, nk)
+
+        ! Write the generated Block 6 grid as pure TETRA_4 cells.
+        ! Geometry is unchanged; only the connectivity is changed.
+
+        USE cgns
+        IMPLICIT NONE
+
+        CHARACTER(LEN=*), INTENT(IN) :: output_file_name
+        REAL(8), INTENT(IN) :: xg(:,:,:)
+        REAL(8), INTENT(IN) :: yg(:,:,:)
+        REAL(8), INTENT(IN) :: zg(:,:,:)
+        INTEGER, INTENT(IN) :: ni
+        INTEGER, INTENT(IN) :: nj
+        INTEGER, INTENT(IN) :: nk
+
+        INTEGER :: ierr
+        INTEGER :: file_id
+        INTEGER :: base_id
+        INTEGER :: zone_id
+        INTEGER :: coord_id
+        INTEGER :: section_id
+
+        INTEGER :: i
+        INTEGER :: j
+        INTEGER :: k
+        INTEGER :: id_node
+        INTEGER :: etet
+
+        INTEGER :: nc_i
+        INTEGER :: nc_j
+        INTEGER :: nc_k
+
+        INTEGER :: n000
+        INTEGER :: n100
+        INTEGER :: n110
+        INTEGER :: n010
+        INTEGER :: n001
+        INTEGER :: n101
+        INTEGER :: n111
+        INTEGER :: n011
+
+        INTEGER :: nnode
+        INTEGER :: ntet_all
+
+        INTEGER(KIND=cgsize_t) :: isize(3)
+        INTEGER(KIND=cgsize_t) :: element_start
+        INTEGER(KIND=cgsize_t) :: element_end
+
+        REAL(8), ALLOCATABLE :: xu_all(:)
+        REAL(8), ALLOCATABLE :: yu_all(:)
+        REAL(8), ALLOCATABLE :: zu_all(:)
+        INTEGER(KIND=cgsize_t), ALLOCATABLE :: tet_all_conn(:)
+
+        nc_i = ni - 1
+        nc_j = nj - 1
+        nc_k = nk - 1
+
+        nnode = ni*nj*nk
+        ntet_all = 6*nc_i*nc_j*nc_k
+
+        IF (ni < 2 .OR. nj < 2 .OR. nk < 2) THEN
+            PRINT *, "ERROR: all-tetrahedral output needs ni,nj,nk >= 2."
+            PRINT *, "ni,nj,nk = ", ni,nj,nk
+            STOP 1
+        END IF
+
+        ALLOCATE(xu_all(nnode), yu_all(nnode), zu_all(nnode))
+        ALLOCATE(tet_all_conn(4*ntet_all))
+
+        DO k = 1, nk
+            DO j = 1, nj
+                DO i = 1, ni
+                    id_node = node_id(i,j,k,ni,nj)
+                    xu_all(id_node) = xg(i,j,k)
+                    yu_all(id_node) = yg(i,j,k)
+                    zu_all(id_node) = zg(i,j,k)
+                END DO
+            END DO
+        END DO
+
+        etet = 0
+
+        DO k = 1, nc_k
+            DO j = 1, nc_j
+                DO i = 1, nc_i
+
+                    CALL get_hex_corner_nodes(i,j,k,ni,nj, &
+                        n000,n100,n110,n010,n001,n101,n111,n011)
+
+                    ! Strict global Freudenthal/Kuhn split.
+                    ! Same diagonal convention as the existing tet core.
+                    CALL add_tet(tet_all_conn, etet, n000, n100, n110, n111)
+                    CALL add_tet(tet_all_conn, etet, n000, n100, n101, n111)
+                    CALL add_tet(tet_all_conn, etet, n000, n010, n110, n111)
+                    CALL add_tet(tet_all_conn, etet, n000, n010, n011, n111)
+                    CALL add_tet(tet_all_conn, etet, n000, n001, n101, n111)
+                    CALL add_tet(tet_all_conn, etet, n000, n001, n011, n111)
+
+                END DO
+            END DO
+        END DO
+
+        IF (etet /= ntet_all) THEN
+            PRINT *, "ERROR: all-tetrahedral count mismatch."
+            PRINT *, "etet, ntet_all = ", etet, ntet_all
+            STOP 1
+        END IF
+
+        PRINT *, "All-tetrahedral Block 6 nodes = ", nnode
+        PRINT *, "All-tetrahedral Block 6 TETRA_4 cells = ", ntet_all
+
+        CALL cg_open_f(output_file_name, CG_MODE_WRITE, file_id, ierr)
+        CALL check_cgns_error(ierr, "cg_open_f all-tetra output")
+
+        CALL cg_base_write_f(file_id, "Block6AllTetrahedralHybridBase", 3, 3, base_id, ierr)
+        CALL check_cgns_error(ierr, "cg_base_write_f all-tetra output")
+
+        isize(1) = INT(nnode, KIND=cgsize_t)
+        isize(2) = INT(ntet_all, KIND=cgsize_t)
+        isize(3) = INT(0, KIND=cgsize_t)
+
+        CALL cg_zone_write_f(file_id, base_id, &
+            "Block6_AllTetrahedralHybrid", isize, Unstructured, zone_id, ierr)
+        CALL check_cgns_error(ierr, "cg_zone_write_f all-tetra output")
+
+        CALL cg_coord_write_f(file_id, base_id, zone_id, RealDouble, &
+            "CoordinateX", xu_all, coord_id, ierr)
+        CALL check_cgns_error(ierr, "cg_coord_write_f all-tetra X")
+
+        CALL cg_coord_write_f(file_id, base_id, zone_id, RealDouble, &
+            "CoordinateY", yu_all, coord_id, ierr)
+        CALL check_cgns_error(ierr, "cg_coord_write_f all-tetra Y")
+
+        CALL cg_coord_write_f(file_id, base_id, zone_id, RealDouble, &
+            "CoordinateZ", zu_all, coord_id, ierr)
+        CALL check_cgns_error(ierr, "cg_coord_write_f all-tetra Z")
+
+        element_start = INT(1, KIND=cgsize_t)
+        element_end   = INT(ntet_all, KIND=cgsize_t)
+
+        CALL cg_section_write_f(file_id, base_id, zone_id, &
+            "AllLogicalCellsAsTetra4", TETRA_4, element_start, element_end, &
+            0, tet_all_conn, section_id, ierr)
+        CALL check_cgns_error(ierr, "cg_section_write_f all-tetra cells")
+
+        CALL write_blade_surface_check(file_id, xu_all, yu_all, zu_all, ni, nj, nk)
+
+        CALL cg_close_f(file_id, ierr)
+        CALL check_cgns_error(ierr, "cg_close_f all-tetra output")
+
+        DEALLOCATE(xu_all, yu_all, zu_all)
+        DEALLOCATE(tet_all_conn)
+
+    END SUBROUTINE write_all_tetrahedral_hybrid_block6
+
+
+    SUBROUTINE write_blade_surface_check(file_id,xu,yu,zu,ni,nj,nk)
+        USE cgns
+        IMPLICIT NONE
+        INTEGER, INTENT(IN) :: file_id, ni, nj, nk
+        REAL(8), INTENT(IN) :: xu(:), yu(:), zu(:)
+
+        INTEGER :: ierr, base_id, zone_id, coord_id, section_id
+        INTEGER :: nnode,nquad,i,k,id,lid,q
+        INTEGER :: n00,n10,n11,n01
+        INTEGER(KIND=cgsize_t) :: isize(3), element_start, element_end
+        REAL(8), ALLOCATABLE :: xb(:),yb(:),zb(:)
+        INTEGER(KIND=cgsize_t), ALLOCATABLE :: quad_conn(:)
+
+        nnode=ni*nk
+        nquad=(ni-1)*(nk-1)
+
+        ALLOCATE(xb(nnode),yb(nnode),zb(nnode))
+        ALLOCATE(quad_conn(4*nquad))
+
+        DO k=1,nk
+            DO i=1,ni
+                id=node_id(i,1,k,ni,nj)
+                lid=i+(k-1)*ni
+                xb(lid)=xu(id)
+                yb(lid)=yu(id)
+                zb(lid)=zu(id)
+            END DO
+        END DO
+
+        q=0
+        DO k=1,nk-1
+            DO i=1,ni-1
+                n00=i+(k-1)*ni
+                n10=i+1+(k-1)*ni
+                n11=i+1+k*ni
+                n01=i+k*ni
+                q=q+1
+                quad_conn(4*q-3)=INT(n00,KIND=cgsize_t)
+                quad_conn(4*q-2)=INT(n10,KIND=cgsize_t)
+                quad_conn(4*q-1)=INT(n11,KIND=cgsize_t)
+                quad_conn(4*q)  =INT(n01,KIND=cgsize_t)
+            END DO
+        END DO
+
+        CALL cg_base_write_f(file_id, "BladeSurfaceCheckBase", 2, 3, base_id, ierr)
+        CALL check_cgns_error(ierr, "cg_base_write_f BladeSurfaceCheckBase")
+
+        isize(1)=INT(nnode,KIND=cgsize_t)
+        isize(2)=INT(nquad,KIND=cgsize_t)
+        isize(3)=INT(0,KIND=cgsize_t)
+
+        CALL cg_zone_write_f(file_id,base_id,"Redistributed_BladeSurface_Check", &
+            isize,Unstructured,zone_id,ierr)
+        CALL check_cgns_error(ierr, "cg_zone_write_f blade check")
+
+        CALL cg_coord_write_f(file_id,base_id,zone_id,RealDouble,"CoordinateX",xb,coord_id,ierr)
+        CALL check_cgns_error(ierr, "CoordinateX blade check")
+        CALL cg_coord_write_f(file_id,base_id,zone_id,RealDouble,"CoordinateY",yb,coord_id,ierr)
+        CALL check_cgns_error(ierr, "CoordinateY blade check")
+        CALL cg_coord_write_f(file_id,base_id,zone_id,RealDouble,"CoordinateZ",zb,coord_id,ierr)
+        CALL check_cgns_error(ierr, "CoordinateZ blade check")
+
+        element_start=INT(1,KIND=cgsize_t)
+        element_end=INT(nquad,KIND=cgsize_t)
+
+        CALL cg_section_write_f(file_id,base_id,zone_id, &
+            "RedistributedBladeSurfaceQuads",QUAD_4,element_start,element_end, &
+            0,quad_conn,section_id,ierr)
+        CALL check_cgns_error(ierr, "cg_section_write_f blade check")
+
+        PRINT *, "Blade surface check written. nodes/quads = ", nnode, nquad
+
+        DEALLOCATE(xb,yb,zb,quad_conn)
+    END SUBROUTINE write_blade_surface_check
+
+
+    SUBROUTINE check_cgns_error(ierr, location)
+        IMPLICIT NONE
+        INTEGER, INTENT(IN) :: ierr
+        CHARACTER(LEN=*), INTENT(IN) :: location
+
+        IF (ierr /= CG_OK) THEN
+            PRINT *, "CGNS error at: ", TRIM(location)
+            CALL cg_error_print_f()
+            STOP 1
+        END IF
+    END SUBROUTINE check_cgns_error
+
+END PROGRAM block6_structured_yheight_patch_conformal_hybrid_fill
